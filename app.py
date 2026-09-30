@@ -511,3 +511,31 @@ def telegram_test():
             "success": False,
             "error": str(exc)
         }), 500
+
+@app.route("/telegram-debug")
+def telegram_debug():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+
+    if not token:
+        return jsonify({
+            "token_present": False
+        }), 500
+
+    try:
+        response = requests.get(
+            f"https://api.telegram.org/bot{token}/getMe",
+            timeout=10
+        )
+
+        return jsonify({
+            "token_present": True,
+            "token_length": len(token),
+            "telegram_status": response.status_code,
+            "telegram_response": response.json()
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "token_present": True,
+            "error": str(exc)
+        }), 500
