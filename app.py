@@ -514,28 +514,26 @@ def telegram_test():
 
 @app.route("/telegram-debug")
 def telegram_debug():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-    if not token:
-        return jsonify({
-            "token_present": False
-        }), 500
+    stripped = token.strip()
 
-    try:
-        response = requests.get(
-            f"https://api.telegram.org/bot{token}/getMe",
-            timeout=10
+    parts = stripped.split(":", 1)
+
+    return jsonify({
+        "token_present": bool(stripped),
+        "token_length": len(stripped),
+        "contains_spaces": " " in stripped,
+        "contains_newline": "\n" in stripped or "\r" in stripped,
+        "starts_with_quote": stripped.startswith(("'", '"')),
+        "ends_with_quote": stripped.endswith(("'", '"')),
+        "colon_count": stripped.count(":"),
+        "bot_id_part": parts[0] if len(parts) == 2 else "NO_COLON",
+        "bot_id_matches_CPDD": (
+            len(parts) == 2 and
+            parts[0] == "8945094246"
+        ),
+        "secret_part_length": (
+            len(parts[1]) if len(parts) == 2 else 0
         )
-
-        return jsonify({
-            "token_present": True,
-            "token_length": len(token),
-            "telegram_status": response.status_code,
-            "telegram_response": response.json()
-        })
-
-    except Exception as exc:
-        return jsonify({
-            "token_present": True,
-            "error": str(exc)
-        }), 500
+    })
