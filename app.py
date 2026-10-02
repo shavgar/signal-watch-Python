@@ -2,6 +2,7 @@ import os
 import re
 import time
 import threading
+import statistics
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -14,20 +15,20 @@ app = Flask(__name__)
 
 
 # ============================================================
-# SIGNAL WATCH CONFIGURATION
+# CONFIG
 # ============================================================
 
-BYBIT_ENDPOINTS = [
-    "https://api.bybit.com/v5/market/tickers?category=spot",
-    "https://api.bytick.com/v5/market/tickers?category=spot",
+BYBIT_API_BASES = [
+    "https://api.bybit.com",
+    "https://api.bytick.com",
 ]
+
+TELEGRAM_API_BASE = "https://api.telegram.org"
+
+UK_TIMEZONE = ZoneInfo("Europe/London")
 
 
 def clean_secret(value):
-    """
-    Remove accidental spaces / zero-width characters from
-    environment variables.
-    """
     return re.sub(
         r"[\s\u200B\u200C\u200D\uFEFF]",
         "",
@@ -36,95 +37,146 @@ def clean_secret(value):
 
 
 TELEGRAM_BOT_TOKEN = clean_secret(
-    os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    os.environ.get(
+        "TELEGRAM_BOT_TOKEN",
+        ""
+    )
 )
 
 TELEGRAM_CHAT_ID = clean_secret(
-    os.environ.get("TELEGRAM_CHAT_ID", "")
+    os.environ.get(
+        "TELEGRAM_CHAT_ID",
+        ""
+    )
 )
 
 
-# ------------------------------------------------------------
-# NORMAL PUMP / CRASH THRESHOLDS
-# ------------------------------------------------------------
+# ============================================================
+# EXISTING PUMP / CRASH RULES
+# ============================================================
 
 WINDOWS = {
-    5: 10.0,     # ±10% in 5 minutes
-    10: 15.0,    # ±15% in 10 minutes
-    15: 20.0,    # ±20% in 15 minutes
+    5: 10.0,
+    10: 15.0,
+    15: 20.0,
 }
 
-
-# ------------------------------------------------------------
-# 24-HOUR THRESHOLD
-# ------------------------------------------------------------
-
 DAILY_THRESHOLD = 30.0
-
-
-# ------------------------------------------------------------
-# RE-ARM
-# ------------------------------------------------------------
 
 REARM_MARGIN = 2.0
 
 
-# ------------------------------------------------------------
+# ============================================================
 # HISTORY
-#
-# We now keep 3 hours because the staircase detector needs
-# several completed 15-minute candles.
-# ------------------------------------------------------------
+# ============================================================
 
+# Keep 3 hours of one-minute snapshots.
 HISTORY_KEEP_SECONDS = 3 * 60 * 60
 
 REFERENCE_TOLERANCE_SECONDS = 90
 
 
-# ------------------------------------------------------------
-# STAIRCASE DETECTOR
-# ------------------------------------------------------------
+# ============================================================
+# STAIRCASE
+# ============================================================
 
 STAIRCASE_TIMEFRAME_MINUTES = 15
 
-# Analyse 5 completed 15-minute candles = about 75 minutes.
 STAIRCASE_CANDLES = 5
 
-# At least 4 of the 5 candles should close green.
 STAIRCASE_MIN_GREEN_CANDLES = 4
 
-# With 5 candles there are 4 close-to-close comparisons.
 STAIRCASE_MIN_HIGHER_CLOSES = 4
 
-# At least 3 of the 4 low comparisons should be higher.
 STAIRCASE_MIN_HIGHER_LOWS = 3
 
-# The gradual move should already show some strength...
 STAIRCASE_MIN_TOTAL_RISE = 2.5
 
-# ...but should not already be a huge pump.
 STAIRCASE_MAX_TOTAL_RISE = 12.0
 
-# Prevent a large breakout candle from being mistaken
-# for the pre-breakout staircase.
 STAIRCASE_MAX_CANDLE_BODY = 4.0
 
-# Avoid unusually violent candles.
 STAIRCASE_MAX_CANDLE_RANGE = 6.0
 
-# Allow one small red candle, but not a large dump candle.
 STAIRCASE_MAX_RED_BODY = 1.5
 
-# Each synthetic 15-minute candle should contain
-# enough 1-minute observations.
 STAIRCASE_MIN_SAMPLES_PER_CANDLE = 8
 
-# If a pattern disappears then forms again immediately,
-# avoid repeatedly alerting.
-STAIRCASE_COOLDOWN_SECONDS = 2 * 60 * 60
+STAIRCASE_COOLDOWN_SECONDS = (
+    2 * 60 * 60
+)
 
 
-UK_TIMEZONE = ZoneInfo("Europe/London")
+# ============================================================
+# EARLY PUMP
+# ============================================================
+
+# Cheap first-stage filter.
+#
+# A coin only gets the more expensive
+# volume / trades / order-book check
+# if it first starts moving unusually.
+
+EARLY_PREFILTER_1M = 1.5
+
+EARLY_PREFILTER_3M = 3.0
+
+EARLY_PREFILTER_5M = 4.5
+
+
+# Score needed for Telegram alert.
+
+EARLY_ALERT_SCORE = 70
+
+EARLY_STRONG_SCORE = 85
+
+
+# If the score falls below this,
+# the coin becomes eligible again later.
+
+EARLY_REARM_SCORE = 55
+
+
+# Prevent repeated alerts for same coin.
+
+EARLY_COOLDOWN_SECONDS = (
+    30 * 60
+)
+
+
+# Maximum number of suspicious coins
+# we deeply analyse in one cron run.
+
+MAX_DEEP_SCANS_PER_RUN = 15
+
+
+# ============================================================
+# U-TURN AFTER CRASH
+# ============================================================
+
+# Watch a crashed coin for up to 3 hours.
+
+UTURN_WATCH_SECONDS = (
+    3 * 60 * 60
+)
+
+
+# Must recover at least 5% from
+# its post-crash low.
+
+UTURN_MIN_RECOVERY = 5.0
+
+
+# Short-term upward movement needed.
+
+UTURN_MIN_1M_CHANGE = 1.0
+
+UTURN_MIN_3M_CHANGE = 2.0
+
+
+# Minimum U-turn confidence score.
+
+UTURN_ALERT_SCORE = 65
 
 
 # ============================================================
@@ -133,21 +185,62 @@ UK_TIMEZONE = ZoneInfo("Europe/London")
 
 history = []
 
-# Used for normal and 24h anti-spam logic.
-#
-# Example:
-# signal_state["ABCUSDT:5"] = "PUMP"
-# signal_state["ABCUSDT:24h"] = "CRASH"
+
+# Existing Pump / Crash anti-spam.
+
 signal_state = {}
 
-# Staircase anti-spam state.
+
+# Staircase anti-spam.
+
 staircase_active = set()
+
 staircase_last_alert = {}
+
+
+# Early Pump anti-spam.
+
+early_active = set()
+
+early_last_alert = {}
+
+
+# U-turn watches.
+#
+# Example:
+#
+# uturn_watch["ABCUSDT"] = {
+#     ...
+# }
+
+uturn_watch = {}
+
+
+# ============================================================
+# SIGNAL JOURNAL
+#
+# Tracks what happened after alerts.
+#
+# IMPORTANT:
+# Free Render may restart.
+# If it restarts, this memory resets.
+# ============================================================
+
+signal_log = []
+
+MAX_SIGNAL_LOG = 500
+
+
+# ============================================================
+# GENERAL STATE
+# ============================================================
 
 lock = threading.Lock()
 
 first_run = True
+
 last_success = None
+
 last_market_count = 0
 
 
@@ -156,17 +249,20 @@ last_market_count = 0
 # ============================================================
 
 def coin_name(symbol):
-    """
-    BTCUSDT -> BTC
-    ABCUSDT -> ABC
-    """
+
     if symbol.endswith("USDT"):
+
         return symbol[:-4]
 
     return symbol
 
 
 def bybit_spot_url(symbol):
+
+    """
+    Telegram button -> Bybit app
+    -> coin candle / market page.
+    """
 
     native_route = (
         "bybitapp://open/home?"
@@ -178,172 +274,302 @@ def bybit_spot_url(symbol):
 
     fallback_url = (
         "https://www.bybit.com/"
-        f"en-GB/trade/spot/{coin_name(symbol)}/USDT"
+        f"en-GB/trade/spot/"
+        f"{coin_name(symbol)}/USDT"
     )
 
     return (
         "https://app.bybit.com/inapp"
-        f"?by_dp={quote(native_route, safe='')}"
-        f"&by_web_link={quote(fallback_url, safe='')}"
+        f"?by_dp="
+        f"{quote(native_route, safe='')}"
+        f"&by_web_link="
+        f"{quote(fallback_url, safe='')}"
     )
 
 
 # ============================================================
-# BYBIT
+# FORMATTING
 # ============================================================
 
-def fetch_bybit_prices():
+def format_price(price):
+
+    if price >= 1000:
+
+        return (
+            f"${price:,.2f}"
+        )
+
+    if price >= 1:
+
+        return (
+            f"${price:.4f}"
+        )
+
+    if price >= 0.01:
+
+        return (
+            f"${price:.6f}"
+        )
+
+    return (
+        f"${price:.8f}"
+    )
+
+
+def current_uk_time():
+
+    return datetime.now(
+        UK_TIMEZONE
+    ).strftime(
+        "%d %b %Y %H:%M:%S"
+    )
+
+
+def percent_change(
+    new_price,
+    old_price
+):
+
+    if (
+        not old_price
+        or old_price <= 0
+    ):
+
+        return None
+
+    return (
+        (
+            new_price
+            - old_price
+        )
+        / old_price
+    ) * 100
+
+
+def fmt_optional_percent(value):
+
+    if value is None:
+
+        return "warming up"
+
+    return (
+        f"{value:+.2f}%"
+    )
+
+
+def fmt_optional_ratio(value):
+
+    if value is None:
+
+        return "n/a"
+
+    return (
+        f"{value:.2f}x"
+    )
+
+
+def fmt_optional_pressure(value):
+
+    if value is None:
+
+        return "n/a"
+
+    return (
+        f"{value:.1f}%"
+    )
+
+
+# ============================================================
+# BYBIT HTTP
+# ============================================================
+
+def bybit_get(
+    path,
+    params=None,
+    timeout=15
+):
 
     headers = {
-        "User-Agent": "Signal-Watch/1.0"
+        "User-Agent":
+            "Signal-Watch/2.0"
     }
 
     errors = []
 
-    for url in BYBIT_ENDPOINTS:
+    for base in BYBIT_API_BASES:
+
+        url = (
+            base
+            + path
+        )
 
         try:
 
             response = requests.get(
                 url,
+                params=params,
                 headers=headers,
-                timeout=15
+                timeout=timeout
             )
 
-            if response.status_code != 200:
+            if (
+                response.status_code
+                != 200
+            ):
 
                 errors.append(
-                    f"{url}: HTTP {response.status_code}"
+                    f"{url}: "
+                    f"HTTP "
+                    f"{response.status_code}"
                 )
 
                 continue
-
 
             data = response.json()
 
-
-            if data.get("retCode") != 0:
-
-                errors.append(
-                    f"{url}: {data.get('retMsg')}"
-                )
-
-                continue
-
-
-            prices = {}
-
-            daily_data = {}
-
-
-            for ticker in data.get(
-                "result",
-                {}
-            ).get(
-                "list",
-                []
+            if (
+                data.get("retCode")
+                != 0
             ):
 
-                symbol = ticker.get(
-                    "symbol",
-                    ""
-                )
-
-
-                if not symbol.endswith("USDT"):
-                    continue
-
-
-                # ----------------------------
-                # CURRENT PRICE
-                # ----------------------------
-
-                try:
-
-                    price = float(
-                        ticker.get("lastPrice")
-                    )
-
-                except (TypeError, ValueError):
-
-                    continue
-
-
-                if price <= 0:
-                    continue
-
-
-                prices[symbol] = price
-
-
-                # ----------------------------
-                # 24-HOUR DATA
-                # ----------------------------
-
-                try:
-
-                    change_24h = (
-                        float(
-                            ticker.get(
-                                "price24hPcnt"
-                            )
-                        )
-                        * 100
-                    )
-
-
-                    previous_24h = float(
-                        ticker.get(
-                            "prevPrice24h"
-                        )
-                    )
-
-
-                    if previous_24h > 0:
-
-                        daily_data[symbol] = {
-                            "change": change_24h,
-                            "reference_price": previous_24h,
-                            "current_price": price,
-                        }
-
-
-                except (
-                    TypeError,
-                    ValueError
-                ):
-
-                    pass
-
-
-            if len(prices) < 10:
-
                 errors.append(
-                    f"{url}: only "
-                    f"{len(prices)} "
-                    "USDT pairs returned"
+                    f"{url}: "
+                    f"{data.get('retMsg')}"
                 )
 
                 continue
 
-
             return (
-                prices,
-                daily_data,
+                data,
                 url
             )
-
 
         except Exception as exc:
 
             errors.append(
-                f"{url}: {str(exc)}"
+                f"{url}: "
+                f"{str(exc)}"
             )
-
 
     raise RuntimeError(
         "All Bybit endpoints failed: "
         + " | ".join(errors)
+    )
+
+
+# ============================================================
+# FETCH ALL SPOT PRICES
+# ============================================================
+
+def fetch_bybit_prices():
+
+    data, endpoint = bybit_get(
+        "/v5/market/tickers",
+        {
+            "category":
+                "spot"
+        }
+    )
+
+    prices = {}
+
+    daily_data = {}
+
+    for ticker in data.get(
+        "result",
+        {}
+    ).get(
+        "list",
+        []
+    ):
+
+        symbol = ticker.get(
+            "symbol",
+            ""
+        )
+
+        if not symbol.endswith(
+            "USDT"
+        ):
+
+            continue
+
+        try:
+
+            price = float(
+                ticker.get(
+                    "lastPrice"
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            continue
+
+        if price <= 0:
+
+            continue
+
+        prices[
+            symbol
+        ] = price
+
+        try:
+
+            change_24h = (
+                float(
+                    ticker.get(
+                        "price24hPcnt"
+                    )
+                )
+                * 100
+            )
+
+            previous_24h = float(
+                ticker.get(
+                    "prevPrice24h"
+                )
+            )
+
+            if previous_24h > 0:
+
+                daily_data[
+                    symbol
+                ] = {
+
+                    "change":
+                        change_24h,
+
+                    "reference_price":
+                        previous_24h,
+
+                    "current_price":
+                        price,
+                }
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            pass
+
+    if len(prices) < 10:
+
+        raise RuntimeError(
+            f"Only "
+            f"{len(prices)} "
+            f"USDT Spot markets "
+            f"returned."
+        )
+
+    return (
+        prices,
+        daily_data,
+        endpoint
     )
 
 
@@ -358,10 +584,12 @@ def clean_old_history(now):
         - HISTORY_KEEP_SECONDS
     )
 
-
     while (
         history
-        and history[0]["timestamp"] < cutoff
+        and
+        history[0][
+            "timestamp"
+        ] < cutoff
     ):
 
         history.pop(0)
@@ -373,10 +601,13 @@ def save_snapshot(
 ):
 
     history.append({
-        "timestamp": timestamp,
-        "prices": prices,
-    })
 
+        "timestamp":
+            timestamp,
+
+        "prices":
+            prices,
+    })
 
     clean_old_history(
         timestamp
@@ -393,9 +624,7 @@ def find_reference_snapshot(
         - minutes * 60
     )
 
-
     best = None
-
 
     for snapshot in history:
 
@@ -403,27 +632,27 @@ def find_reference_snapshot(
             "timestamp"
         ]
 
-
         if timestamp <= target:
 
             if (
                 best is None
-                or timestamp
+                or
+                timestamp
                 > best["timestamp"]
             ):
 
                 best = snapshot
 
-
     if best is None:
-        return None
 
+        return None
 
     difference = (
         target
-        - best["timestamp"]
+        - best[
+            "timestamp"
+        ]
     )
-
 
     if (
         difference
@@ -432,12 +661,43 @@ def find_reference_snapshot(
 
         return None
 
-
     return best
 
 
+def change_for_symbol(
+    now,
+    symbol,
+    current_price,
+    minutes
+):
+
+    reference = (
+        find_reference_snapshot(
+            now,
+            minutes
+        )
+    )
+
+    if reference is None:
+
+        return None
+
+    reference_price = (
+        reference[
+            "prices"
+        ].get(
+            symbol
+        )
+    )
+
+    return percent_change(
+        current_price,
+        reference_price
+    )
+
+
 # ============================================================
-# NORMAL SIGNAL DETECTION
+# NORMAL 5m / 10m / 15m PUMP + CRASH
 # ============================================================
 
 def detect_signals(
@@ -447,12 +707,10 @@ def detect_signals(
 
     alerts = []
 
-
     for (
         minutes,
         threshold
     ) in WINDOWS.items():
-
 
         reference = (
             find_reference_snapshot(
@@ -461,21 +719,20 @@ def detect_signals(
             )
         )
 
-
         if reference is None:
+
             continue
 
-
         reference_prices = (
-            reference["prices"]
+            reference[
+                "prices"
+            ]
         )
-
 
         for (
             symbol,
             current_price
         ) in current_prices.items():
-
 
             reference_price = (
                 reference_prices.get(
@@ -483,28 +740,25 @@ def detect_signals(
                 )
             )
 
-
             if (
                 not reference_price
-                or reference_price <= 0
+                or
+                reference_price <= 0
             ):
 
                 continue
 
-
             change = (
-                (
-                    current_price
-                    - reference_price
+                percent_change(
+                    current_price,
+                    reference_price
                 )
-                / reference_price
-            ) * 100
-
-
-            state_key = (
-                f"{symbol}:{minutes}"
             )
 
+            state_key = (
+                f"{symbol}:"
+                f"{minutes}"
+            )
 
             previous_state = (
                 signal_state.get(
@@ -512,12 +766,14 @@ def detect_signals(
                 )
             )
 
-
-            # ----------------------------
+            # ------------------------
             # PUMP
-            # ----------------------------
+            # ------------------------
 
-            if change >= threshold:
+            if (
+                change
+                >= threshold
+            ):
 
                 if (
                     previous_state
@@ -525,28 +781,39 @@ def detect_signals(
                 ):
 
                     alerts.append({
-                        "symbol": symbol,
-                        "direction": "PUMP",
+
+                        "symbol":
+                            symbol,
+
+                        "direction":
+                            "PUMP",
+
                         "window_label":
-                            f"{minutes} minutes",
-                        "change": change,
+                            f"{minutes} "
+                            f"minutes",
+
+                        "change":
+                            change,
+
                         "reference_price":
                             reference_price,
+
                         "current_price":
                             current_price,
                     })
-
 
                 signal_state[
                     state_key
                 ] = "PUMP"
 
-
-            # ----------------------------
+            # ------------------------
             # CRASH
-            # ----------------------------
+            # ------------------------
 
-            elif change <= -threshold:
+            elif (
+                change
+                <= -threshold
+            ):
 
                 if (
                     previous_state
@@ -554,26 +821,34 @@ def detect_signals(
                 ):
 
                     alerts.append({
-                        "symbol": symbol,
-                        "direction": "CRASH",
+
+                        "symbol":
+                            symbol,
+
+                        "direction":
+                            "CRASH",
+
                         "window_label":
-                            f"{minutes} minutes",
-                        "change": change,
+                            f"{minutes} "
+                            f"minutes",
+
+                        "change":
+                            change,
+
                         "reference_price":
                             reference_price,
+
                         "current_price":
                             current_price,
                     })
-
 
                 signal_state[
                     state_key
                 ] = "CRASH"
 
-
-            # ----------------------------
+            # ------------------------
             # RE-ARM
-            # ----------------------------
+            # ------------------------
 
             elif (
                 abs(change)
@@ -589,12 +864,11 @@ def detect_signals(
                     None
                 )
 
-
     return alerts
 
 
 # ============================================================
-# 24-HOUR SIGNAL DETECTION
+# 24-HOUR PUMP + CRASH
 # ============================================================
 
 def detect_24h_signals(
@@ -603,22 +877,18 @@ def detect_24h_signals(
 
     alerts = []
 
-
     for (
         symbol,
         data
     ) in daily_data.items():
 
-
         change = data[
             "change"
         ]
 
-
         state_key = (
             f"{symbol}:24h"
         )
-
 
         previous_state = (
             signal_state.get(
@@ -626,10 +896,9 @@ def detect_24h_signals(
             )
         )
 
-
-        # ----------------------------
+        # ------------------------
         # 24H PUMP
-        # ----------------------------
+        # ------------------------
 
         if (
             change
@@ -642,30 +911,37 @@ def detect_24h_signals(
             ):
 
                 alerts.append({
-                    "symbol": symbol,
-                    "direction": "PUMP",
+
+                    "symbol":
+                        symbol,
+
+                    "direction":
+                        "PUMP",
+
                     "window_label":
                         "24 hours",
-                    "change": change,
+
+                    "change":
+                        change,
+
                     "reference_price":
                         data[
                             "reference_price"
                         ],
+
                     "current_price":
                         data[
                             "current_price"
                         ],
                 })
 
-
             signal_state[
                 state_key
             ] = "PUMP"
 
-
-        # ----------------------------
+        # ------------------------
         # 24H CRASH
-        # ----------------------------
+        # ------------------------
 
         elif (
             change
@@ -678,30 +954,37 @@ def detect_24h_signals(
             ):
 
                 alerts.append({
-                    "symbol": symbol,
-                    "direction": "CRASH",
+
+                    "symbol":
+                        symbol,
+
+                    "direction":
+                        "CRASH",
+
                     "window_label":
                         "24 hours",
-                    "change": change,
+
+                    "change":
+                        change,
+
                     "reference_price":
                         data[
                             "reference_price"
                         ],
+
                     "current_price":
                         data[
                             "current_price"
                         ],
                 })
 
-
             signal_state[
                 state_key
             ] = "CRASH"
 
-
-        # ----------------------------
+        # ------------------------
         # RE-ARM
-        # ----------------------------
+        # ------------------------
 
         elif (
             abs(change)
@@ -715,7 +998,6 @@ def detect_24h_signals(
                 state_key,
                 None
             )
-
 
     return alerts
 
@@ -733,9 +1015,6 @@ def build_completed_15m_candles(
         * 60
     )
 
-
-    # Beginning of the current
-    # incomplete 15-minute bucket.
     current_bucket = (
         int(
             now
@@ -743,7 +1022,6 @@ def build_completed_15m_candles(
         )
         * timeframe_seconds
     )
-
 
     first_bucket = (
         current_bucket
@@ -753,25 +1031,26 @@ def build_completed_15m_candles(
         )
     )
 
-
     required_buckets = [
+
         first_bucket
         + (
             i
             * timeframe_seconds
         )
+
         for i in range(
             STAIRCASE_CANDLES
         )
     ]
 
-
     bucket_data = {
+
         bucket: {}
+
         for bucket
         in required_buckets
     }
-
 
     for snapshot in history:
 
@@ -779,15 +1058,13 @@ def build_completed_15m_candles(
             "timestamp"
         ]
 
-
         if (
             timestamp < first_bucket
-            or timestamp
-            >= current_bucket
+            or
+            timestamp >= current_bucket
         ):
 
             continue
-
 
         bucket = (
             int(
@@ -797,75 +1074,85 @@ def build_completed_15m_candles(
             * timeframe_seconds
         )
 
+        if (
+            bucket
+            not in bucket_data
+        ):
 
-        if bucket not in bucket_data:
             continue
-
 
         prices = snapshot[
             "prices"
         ]
-
 
         for (
             symbol,
             price
         ) in prices.items():
 
-
             candle = (
                 bucket_data[
                     bucket
-                ].get(symbol)
+                ].get(
+                    symbol
+                )
             )
-
 
             if candle is None:
 
                 bucket_data[
                     bucket
-                ][symbol] = {
-                    "open": price,
-                    "high": price,
-                    "low": price,
-                    "close": price,
-                    "samples": 1,
-                }
+                ][
+                    symbol
+                ] = {
 
+                    "open":
+                        price,
+
+                    "high":
+                        price,
+
+                    "low":
+                        price,
+
+                    "close":
+                        price,
+
+                    "samples":
+                        1,
+                }
 
             else:
 
                 candle[
                     "high"
                 ] = max(
-                    candle["high"],
+                    candle[
+                        "high"
+                    ],
                     price
                 )
-
 
                 candle[
                     "low"
                 ] = min(
-                    candle["low"],
+                    candle[
+                        "low"
+                    ],
                     price
                 )
-
 
                 candle[
                     "close"
                 ] = price
 
-
                 candle[
                     "samples"
                 ] += 1
 
-
     candles_by_symbol = {}
 
-
     symbols = set()
-
 
     for bucket in required_buckets:
 
@@ -875,40 +1162,39 @@ def build_completed_15m_candles(
             ].keys()
         )
 
-
     for symbol in symbols:
 
         candles = []
 
         valid = True
 
-
         for bucket in required_buckets:
 
             candle = (
                 bucket_data[
                     bucket
-                ].get(symbol)
+                ].get(
+                    symbol
+                )
             )
-
 
             if (
                 candle is None
-                or candle[
+                or
+                candle[
                     "samples"
                 ]
-                < STAIRCASE_MIN_SAMPLES_PER_CANDLE
+                <
+                STAIRCASE_MIN_SAMPLES_PER_CANDLE
             ):
 
                 valid = False
 
                 break
 
-
             candles.append(
                 candle
             )
-
 
         if valid:
 
@@ -916,12 +1202,11 @@ def build_completed_15m_candles(
                 symbol
             ] = candles
 
-
     return candles_by_symbol
 
 
 # ============================================================
-# STAIRCASE PATTERN
+# STAIRCASE METRICS
 # ============================================================
 
 def staircase_metrics(
@@ -929,109 +1214,134 @@ def staircase_metrics(
 ):
 
     green_candles = sum(
+
         1
-        for candle in candles
+
+        for candle
+        in candles
+
         if (
-            candle["close"]
-            > candle["open"]
+            candle[
+                "close"
+            ]
+            >
+            candle[
+                "open"
+            ]
         )
     )
-
 
     higher_closes = sum(
+
         1
+
         for index
         in range(
             1,
             len(candles)
         )
+
         if (
-            candles[index][
+            candles[
+                index
+            ][
                 "close"
             ]
             >
-            candles[index - 1][
+            candles[
+                index - 1
+            ][
                 "close"
             ]
         )
     )
-
 
     higher_lows = sum(
+
         1
+
         for index
         in range(
             1,
             len(candles)
         )
+
         if (
-            candles[index][
+            candles[
+                index
+            ][
                 "low"
             ]
             >
-            candles[index - 1][
+            candles[
+                index - 1
+            ][
                 "low"
             ]
         )
     )
 
-
     first_open = (
-        candles[0]["open"]
+        candles[
+            0
+        ][
+            "open"
+        ]
     )
-
 
     last_close = (
-        candles[-1]["close"]
+        candles[
+            -1
+        ][
+            "close"
+        ]
     )
 
-
     total_rise = (
-        (
-            last_close
-            - first_open
+        percent_change(
+            last_close,
+            first_open
         )
-        / first_open
-    ) * 100
-
+    )
 
     body_changes = []
 
-
     candle_ranges = []
-
 
     for candle in candles:
 
         body = (
-            (
-                candle["close"]
-                - candle["open"]
+            percent_change(
+                candle[
+                    "close"
+                ],
+                candle[
+                    "open"
+                ]
             )
-            / candle["open"]
-        ) * 100
-
+        )
 
         candle_range = (
-            (
-                candle["high"]
-                - candle["low"]
+            percent_change(
+                candle[
+                    "high"
+                ],
+                candle[
+                    "low"
+                ]
             )
-            / candle["low"]
-        ) * 100
-
+        )
 
         body_changes.append(
             body
         )
 
-
         candle_ranges.append(
             candle_range
         )
 
-
     return {
+
         "green_candles":
             green_candles,
 
@@ -1076,6 +1386,7 @@ def qualifies_as_staircase(
 ):
 
     return (
+
         metrics[
             "green_candles"
         ]
@@ -1140,25 +1451,20 @@ def detect_staircases(
 
     global staircase_active
 
-
     candle_sets = (
         build_completed_15m_candles(
             now
         )
     )
 
-
     alerts = []
 
-
     matched_symbols = set()
-
 
     for (
         symbol,
         candles
     ) in candle_sets.items():
-
 
         metrics = (
             staircase_metrics(
@@ -1166,21 +1472,16 @@ def detect_staircases(
             )
         )
 
-
         if not qualifies_as_staircase(
             metrics
         ):
 
             continue
 
-
         matched_symbols.add(
             symbol
         )
 
-
-        # Already alerted while this
-        # particular pattern remains active.
         if (
             symbol
             in staircase_active
@@ -1188,14 +1489,12 @@ def detect_staircases(
 
             continue
 
-
         previous_alert_time = (
             staircase_last_alert.get(
                 symbol,
                 0
             )
         )
-
 
         if (
             now
@@ -1206,56 +1505,1894 @@ def detect_staircases(
 
             continue
 
-
         alerts.append({
-            "symbol": symbol,
+
+            "symbol":
+                symbol,
+
             "direction":
                 "STAIRCASE",
+
             "timeframe":
                 "15m",
+
             "candles":
                 STAIRCASE_CANDLES,
+
             "green_candles":
                 metrics[
                     "green_candles"
                 ],
+
             "higher_closes":
                 metrics[
                     "higher_closes"
                 ],
+
             "higher_lows":
                 metrics[
                     "higher_lows"
                 ],
+
             "total_rise":
                 metrics[
                     "total_rise"
                 ],
+
             "current_price":
                 metrics[
                     "current_price"
                 ],
         })
 
-
         staircase_last_alert[
             symbol
         ] = now
-
 
         staircase_active.add(
             symbol
         )
 
-
-    # Rearm a coin after the staircase
-    # pattern disappears.
     staircase_active.intersection_update(
         matched_symbols
     )
 
+    return alerts
+
+
+# ============================================================
+# REAL BYBIT 1-MINUTE CANDLES
+# ============================================================
+
+def fetch_1m_candles(
+    symbol
+):
+
+    data, _ = bybit_get(
+        "/v5/market/kline",
+        {
+            "category":
+                "spot",
+
+            "symbol":
+                symbol,
+
+            "interval":
+                "1",
+
+            "limit":
+                21,
+        }
+    )
+
+    rows = (
+        data.get(
+            "result",
+            {}
+        ).get(
+            "list",
+            []
+        )
+    )
+
+    candles = []
+
+    for row in rows:
+
+        try:
+
+            candles.append({
+
+                "start":
+                    int(
+                        row[0]
+                    ),
+
+                "open":
+                    float(
+                        row[1]
+                    ),
+
+                "high":
+                    float(
+                        row[2]
+                    ),
+
+                "low":
+                    float(
+                        row[3]
+                    ),
+
+                "close":
+                    float(
+                        row[4]
+                    ),
+
+                "volume":
+                    float(
+                        row[5]
+                    ),
+
+                "turnover":
+                    float(
+                        row[6]
+                    ),
+            })
+
+        except (
+            TypeError,
+            ValueError,
+            IndexError
+        ):
+
+            continue
+
+    # Bybit returns newest first.
+
+    return candles
+
+
+# ============================================================
+# VOLUME ANALYSIS
+# ============================================================
+
+def volume_metrics(
+    candles
+):
+
+    """
+    Compare latest completed
+    1-minute candle against
+    previous 10 completed minutes.
+    """
+
+    if len(candles) < 12:
+
+        return {
+
+            "volume_ratio":
+                None,
+
+            "turnover_ratio":
+                None,
+
+            "latest_volume":
+                None,
+
+            "latest_turnover":
+                None,
+        }
+
+    latest_completed = (
+        candles[1]
+    )
+
+    baseline = (
+        candles[
+            2:12
+        ]
+    )
+
+    baseline_volumes = [
+
+        candle[
+            "volume"
+        ]
+
+        for candle
+        in baseline
+
+        if (
+            candle[
+                "volume"
+            ]
+            > 0
+        )
+    ]
+
+    baseline_turnover = [
+
+        candle[
+            "turnover"
+        ]
+
+        for candle
+        in baseline
+
+        if (
+            candle[
+                "turnover"
+            ]
+            > 0
+        )
+    ]
+
+    volume_ratio = None
+
+    turnover_ratio = None
+
+    if baseline_volumes:
+
+        normal_volume = (
+            statistics.median(
+                baseline_volumes
+            )
+        )
+
+        if normal_volume > 0:
+
+            volume_ratio = (
+                latest_completed[
+                    "volume"
+                ]
+                /
+                normal_volume
+            )
+
+    if baseline_turnover:
+
+        normal_turnover = (
+            statistics.median(
+                baseline_turnover
+            )
+        )
+
+        if normal_turnover > 0:
+
+            turnover_ratio = (
+                latest_completed[
+                    "turnover"
+                ]
+                /
+                normal_turnover
+            )
+
+    return {
+
+        "volume_ratio":
+            volume_ratio,
+
+        "turnover_ratio":
+            turnover_ratio,
+
+        "latest_volume":
+            latest_completed[
+                "volume"
+            ],
+
+        "latest_turnover":
+            latest_completed[
+                "turnover"
+            ],
+    }
+
+
+# ============================================================
+# BUY / SELL TRADE PRESSURE
+# ============================================================
+
+def fetch_trade_pressure(
+    symbol
+):
+
+    data, _ = bybit_get(
+        "/v5/market/recent-trade",
+        {
+            "category":
+                "spot",
+
+            "symbol":
+                symbol,
+
+            "limit":
+                60,
+        }
+    )
+
+    buy_notional = 0.0
+
+    sell_notional = 0.0
+
+
+    # Ignore trades older than 2 minutes
+    # for slower coins.
+
+    cutoff_ms = (
+        int(
+            time.time()
+            * 1000
+        )
+        -
+        (
+            2
+            * 60
+            * 1000
+        )
+    )
+
+    for trade in (
+        data.get(
+            "result",
+            {}
+        ).get(
+            "list",
+            []
+        )
+    ):
+
+        try:
+
+            price = float(
+                trade.get(
+                    "price"
+                )
+            )
+
+            size = float(
+                trade.get(
+                    "size"
+                )
+            )
+
+            side = trade.get(
+                "side",
+                ""
+            )
+
+            trade_time = int(
+                trade.get(
+                    "time"
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            continue
+
+        if (
+            trade_time
+            < cutoff_ms
+        ):
+
+            continue
+
+        notional = (
+            price
+            * size
+        )
+
+        if side == "Buy":
+
+            buy_notional += (
+                notional
+            )
+
+        elif side == "Sell":
+
+            sell_notional += (
+                notional
+            )
+
+    total = (
+        buy_notional
+        + sell_notional
+    )
+
+    if total > 0:
+
+        buy_pressure = (
+            buy_notional
+            / total
+        ) * 100
+
+    else:
+
+        buy_pressure = None
+
+    return {
+
+        "buy_pressure":
+            buy_pressure,
+
+        "buy_notional":
+            buy_notional,
+
+        "sell_notional":
+            sell_notional,
+    }
+
+
+# ============================================================
+# ORDER BOOK PRESSURE
+# ============================================================
+
+def fetch_orderbook_pressure(
+    symbol
+):
+
+    data, _ = bybit_get(
+        "/v5/market/orderbook",
+        {
+            "category":
+                "spot",
+
+            "symbol":
+                symbol,
+
+            "limit":
+                50,
+        }
+    )
+
+    result = data.get(
+        "result",
+        {}
+    )
+
+    bid_notional = 0.0
+
+    ask_notional = 0.0
+
+    for row in result.get(
+        "b",
+        []
+    ):
+
+        try:
+
+            price = float(
+                row[0]
+            )
+
+            size = float(
+                row[1]
+            )
+
+            bid_notional += (
+                price
+                * size
+            )
+
+        except (
+            TypeError,
+            ValueError,
+            IndexError
+        ):
+
+            continue
+
+    for row in result.get(
+        "a",
+        []
+    ):
+
+        try:
+
+            price = float(
+                row[0]
+            )
+
+            size = float(
+                row[1]
+            )
+
+            ask_notional += (
+                price
+                * size
+            )
+
+        except (
+            TypeError,
+            ValueError,
+            IndexError
+        ):
+
+            continue
+
+    total = (
+        bid_notional
+        + ask_notional
+    )
+
+    if total > 0:
+
+        bid_pressure = (
+            bid_notional
+            / total
+        ) * 100
+
+    else:
+
+        bid_pressure = None
+
+    return {
+
+        "bid_pressure":
+            bid_pressure,
+
+        "bid_notional":
+            bid_notional,
+
+        "ask_notional":
+            ask_notional,
+    }
+
+
+# ============================================================
+# DEEP ANALYSIS
+# ============================================================
+
+def deep_market_analysis(
+    symbol
+):
+
+    candles = (
+        fetch_1m_candles(
+            symbol
+        )
+    )
+
+    volume = (
+        volume_metrics(
+            candles
+        )
+    )
+
+    trades = (
+        fetch_trade_pressure(
+            symbol
+        )
+    )
+
+    orderbook = (
+        fetch_orderbook_pressure(
+            symbol
+        )
+    )
+
+    return {
+
+        **volume,
+
+        **trades,
+
+        **orderbook,
+    }
+
+
+# ============================================================
+# EARLY PUMP SCORE
+# ============================================================
+
+def momentum_score(
+    change_1m,
+    change_3m,
+    change_5m
+):
+
+    score = 0
+
+    # ------------------------
+    # 1 minute
+    # ------------------------
+
+    if (
+        change_1m
+        is not None
+    ):
+
+        if change_1m >= 3.0:
+
+            score += 14
+
+        elif change_1m >= 2.0:
+
+            score += 11
+
+        elif change_1m >= 1.5:
+
+            score += 8
+
+
+    # ------------------------
+    # 3 minutes
+    # ------------------------
+
+    if (
+        change_3m
+        is not None
+    ):
+
+        if change_3m >= 6.0:
+
+            score += 10
+
+        elif change_3m >= 4.0:
+
+            score += 8
+
+        elif change_3m >= 3.0:
+
+            score += 6
+
+
+    # ------------------------
+    # 5 minutes
+    # ------------------------
+
+    if (
+        change_5m
+        is not None
+    ):
+
+        if change_5m >= 8.0:
+
+            score += 7
+
+        elif change_5m >= 6.0:
+
+            score += 6
+
+        elif change_5m >= 4.5:
+
+            score += 4
+
+
+    # Bonus if all are positive.
+
+    if (
+        change_1m is not None
+        and
+        change_3m is not None
+        and
+        change_5m is not None
+        and
+        change_1m > 0
+        and
+        change_3m > 0
+        and
+        change_5m > 0
+    ):
+
+        score += 4
+
+    return min(
+        score,
+        35
+    )
+
+
+def volume_score(
+    volume_ratio
+):
+
+    if volume_ratio is None:
+
+        return 0
+
+    if volume_ratio >= 6:
+
+        return 30
+
+    if volume_ratio >= 4:
+
+        return 25
+
+    if volume_ratio >= 3:
+
+        return 18
+
+    if volume_ratio >= 2:
+
+        return 10
+
+    return 0
+
+
+def buy_pressure_score(
+    buy_pressure
+):
+
+    if buy_pressure is None:
+
+        return 0
+
+    if buy_pressure >= 75:
+
+        return 20
+
+    if buy_pressure >= 70:
+
+        return 16
+
+    if buy_pressure >= 65:
+
+        return 12
+
+    if buy_pressure >= 60:
+
+        return 8
+
+    return 0
+
+
+def orderbook_score(
+    bid_pressure
+):
+
+    if bid_pressure is None:
+
+        return 0
+
+    if bid_pressure >= 70:
+
+        return 15
+
+    if bid_pressure >= 65:
+
+        return 12
+
+    if bid_pressure >= 60:
+
+        return 9
+
+    if bid_pressure >= 55:
+
+        return 5
+
+    return 0
+
+
+def calculate_early_score(
+    change_1m,
+    change_3m,
+    change_5m,
+    analysis
+):
+
+    parts = {
+
+        "momentum":
+            momentum_score(
+                change_1m,
+                change_3m,
+                change_5m
+            ),
+
+        "volume":
+            volume_score(
+                analysis.get(
+                    "volume_ratio"
+                )
+            ),
+
+        "buy_pressure":
+            buy_pressure_score(
+                analysis.get(
+                    "buy_pressure"
+                )
+            ),
+
+        "orderbook":
+            orderbook_score(
+                analysis.get(
+                    "bid_pressure"
+                )
+            ),
+    }
+
+    parts[
+        "total"
+    ] = sum(
+        parts.values()
+    )
+
+    return parts
+
+
+# ============================================================
+# EARLY PUMP DETECTOR
+# ============================================================
+
+def detect_early_pumps(
+    now,
+    current_prices,
+    deep_cache
+):
+
+    global early_active
+
+    candidates = []
+
+
+    # ========================================================
+    # CHEAP FIRST SCAN
+    # ========================================================
+
+    for (
+        symbol,
+        current_price
+    ) in current_prices.items():
+
+        change_1m = (
+            change_for_symbol(
+                now,
+                symbol,
+                current_price,
+                1
+            )
+        )
+
+        change_3m = (
+            change_for_symbol(
+                now,
+                symbol,
+                current_price,
+                3
+            )
+        )
+
+        change_5m = (
+            change_for_symbol(
+                now,
+                symbol,
+                current_price,
+                5
+            )
+        )
+
+
+        suspicious = (
+
+            (
+                change_1m is not None
+                and
+                change_1m
+                >=
+                EARLY_PREFILTER_1M
+            )
+
+            or
+
+            (
+                change_3m is not None
+                and
+                change_3m
+                >=
+                EARLY_PREFILTER_3M
+            )
+
+            or
+
+            (
+                change_5m is not None
+                and
+                change_5m
+                >=
+                EARLY_PREFILTER_5M
+            )
+        )
+
+
+        if not suspicious:
+
+            continue
+
+
+        # If the normal +10% / 5m
+        # PUMP threshold has already
+        # been reached, don't send
+        # another EARLY alert.
+
+        if (
+            change_5m
+            is not None
+            and
+            change_5m
+            >= WINDOWS[5]
+        ):
+
+            continue
+
+
+        rank = max(
+
+            change_1m
+            or 0,
+
+            change_3m
+            or 0,
+
+            change_5m
+            or 0
+        )
+
+
+        candidates.append({
+
+            "symbol":
+                symbol,
+
+            "current_price":
+                current_price,
+
+            "change_1m":
+                change_1m,
+
+            "change_3m":
+                change_3m,
+
+            "change_5m":
+                change_5m,
+
+            "rank":
+                rank,
+        })
+
+
+    # Strongest suspicious movers first.
+
+    candidates.sort(
+        key=lambda item:
+            item["rank"],
+        reverse=True
+    )
+
+
+    # Safety cap.
+
+    candidates = (
+        candidates[
+            :MAX_DEEP_SCANS_PER_RUN
+        ]
+    )
+
+
+    alerts = []
+
+    matched_symbols = set()
+
+
+    # ========================================================
+    # DEEP ANALYSIS
+    # ========================================================
+
+    for candidate in candidates:
+
+        symbol = candidate[
+            "symbol"
+        ]
+
+        try:
+
+            if (
+                symbol
+                not in deep_cache
+            ):
+
+                deep_cache[
+                    symbol
+                ] = (
+                    deep_market_analysis(
+                        symbol
+                    )
+                )
+
+            analysis = (
+                deep_cache[
+                    symbol
+                ]
+            )
+
+        except Exception as exc:
+
+            print(
+                f"Deep analysis failed "
+                f"for {symbol}:",
+                exc
+            )
+
+            continue
+
+
+        score_parts = (
+            calculate_early_score(
+
+                candidate[
+                    "change_1m"
+                ],
+
+                candidate[
+                    "change_3m"
+                ],
+
+                candidate[
+                    "change_5m"
+                ],
+
+                analysis
+            )
+        )
+
+
+        total_score = (
+            score_parts[
+                "total"
+            ]
+        )
+
+
+        # ====================================================
+        # ALERT
+        # ====================================================
+
+        if (
+            total_score
+            >= EARLY_ALERT_SCORE
+        ):
+
+            matched_symbols.add(
+                symbol
+            )
+
+            previous_alert_time = (
+                early_last_alert.get(
+                    symbol,
+                    0
+                )
+            )
+
+            if (
+                symbol
+                not in early_active
+                and
+                (
+                    now
+                    - previous_alert_time
+                    >=
+                    EARLY_COOLDOWN_SECONDS
+                )
+            ):
+
+                alerts.append({
+
+                    **candidate,
+
+                    **analysis,
+
+                    "score":
+                        total_score,
+
+                    "score_parts":
+                        score_parts,
+
+                    "strong":
+                        (
+                            total_score
+                            >=
+                            EARLY_STRONG_SCORE
+                        ),
+                })
+
+
+                early_last_alert[
+                    symbol
+                ] = now
+
+                early_active.add(
+                    symbol
+                )
+
+
+        # ====================================================
+        # RE-ARM
+        # ====================================================
+
+        elif (
+            total_score
+            <= EARLY_REARM_SCORE
+        ):
+
+            early_active.discard(
+                symbol
+            )
+
+
+    candidate_symbols = {
+
+        item[
+            "symbol"
+        ]
+
+        for item
+        in candidates
+    }
+
+
+    for symbol in list(
+        early_active
+    ):
+
+        if (
+            symbol
+            not in candidate_symbols
+            and
+            symbol
+            not in matched_symbols
+        ):
+
+            early_active.discard(
+                symbol
+            )
+
 
     return alerts
+
+
+# ============================================================
+# START U-TURN WATCH AFTER CRASH
+# ============================================================
+
+def register_crash_for_uturn(
+    alert,
+    now
+):
+
+    symbol = alert[
+        "symbol"
+    ]
+
+    existing = (
+        uturn_watch.get(
+            symbol
+        )
+    )
+
+
+    # First crash alert.
+
+    if existing is None:
+
+        uturn_watch[
+            symbol
+        ] = {
+
+            "started_at":
+                now,
+
+            "reference_price":
+                alert[
+                    "reference_price"
+                ],
+
+            "crash_price":
+                alert[
+                    "current_price"
+                ],
+
+            "lowest_price":
+                alert[
+                    "current_price"
+                ],
+
+            "crash_change":
+                alert[
+                    "change"
+                ],
+
+            "window_label":
+                alert[
+                    "window_label"
+                ],
+        }
+
+        return
+
+
+    # A second crash signal for the
+    # same coin can update the episode.
+
+    existing[
+        "started_at"
+    ] = now
+
+
+    existing[
+        "lowest_price"
+    ] = min(
+
+        existing[
+            "lowest_price"
+        ],
+
+        alert[
+            "current_price"
+        ]
+    )
+
+
+    if (
+        abs(
+            alert[
+                "change"
+            ]
+        )
+        >
+        abs(
+            existing[
+                "crash_change"
+            ]
+        )
+    ):
+
+        existing[
+            "crash_change"
+        ] = alert[
+            "change"
+        ]
+
+        existing[
+            "window_label"
+        ] = alert[
+            "window_label"
+        ]
+
+        existing[
+            "reference_price"
+        ] = alert[
+            "reference_price"
+        ]
+
+
+# ============================================================
+# U-TURN SCORE
+# ============================================================
+
+def uturn_score(
+    recovery,
+    change_1m,
+    change_3m,
+    analysis
+):
+
+    score = 0
+
+
+    # ========================================================
+    # RECOVERY FROM BOTTOM
+    # Maximum = 25
+    # ========================================================
+
+    if recovery >= 10:
+
+        score += 25
+
+    elif recovery >= 8:
+
+        score += 22
+
+    elif recovery >= 6:
+
+        score += 18
+
+    elif recovery >= 5:
+
+        score += 15
+
+
+    # ========================================================
+    # 1M MOMENTUM
+    # ========================================================
+
+    if (
+        change_1m
+        is not None
+    ):
+
+        if change_1m >= 2:
+
+            score += 7
+
+        elif change_1m >= 1:
+
+            score += 4
+
+
+    # ========================================================
+    # 3M MOMENTUM
+    # ========================================================
+
+    if (
+        change_3m
+        is not None
+    ):
+
+        if change_3m >= 4:
+
+            score += 8
+
+        elif change_3m >= 2:
+
+            score += 5
+
+
+    # ========================================================
+    # VOLUME
+    # Maximum contribution here = 25
+    # ========================================================
+
+    score += min(
+
+        volume_score(
+            analysis.get(
+                "volume_ratio"
+            )
+        ),
+
+        25
+    )
+
+
+    # ========================================================
+    # BUY PRESSURE
+    # ========================================================
+
+    score += (
+        buy_pressure_score(
+            analysis.get(
+                "buy_pressure"
+            )
+        )
+    )
+
+
+    # ========================================================
+    # ORDER BOOK
+    # ========================================================
+
+    score += (
+        orderbook_score(
+            analysis.get(
+                "bid_pressure"
+            )
+        )
+    )
+
+
+    return min(
+        score,
+        100
+    )
+
+
+# ============================================================
+# U-TURN DETECTOR
+# ============================================================
+
+def detect_uturns(
+    now,
+    current_prices,
+    deep_cache
+):
+
+    alerts = []
+
+    finished = []
+
+
+    for (
+        symbol,
+        watch
+    ) in list(
+        uturn_watch.items()
+    ):
+
+
+        # Stop watching after 3 hours.
+
+        if (
+            now
+            - watch[
+                "started_at"
+            ]
+            >
+            UTURN_WATCH_SECONDS
+        ):
+
+            finished.append(
+                symbol
+            )
+
+            continue
+
+
+        current_price = (
+            current_prices.get(
+                symbol
+            )
+        )
+
+
+        if not current_price:
+
+            continue
+
+
+        # Keep updating the crash bottom.
+
+        if (
+            current_price
+            <
+            watch[
+                "lowest_price"
+            ]
+        ):
+
+            watch[
+                "lowest_price"
+            ] = current_price
+
+
+        recovery = (
+            percent_change(
+
+                current_price,
+
+                watch[
+                    "lowest_price"
+                ]
+            )
+        )
+
+
+        if recovery is None:
+
+            continue
+
+
+        change_1m = (
+            change_for_symbol(
+                now,
+                symbol,
+                current_price,
+                1
+            )
+        )
+
+
+        change_3m = (
+            change_for_symbol(
+                now,
+                symbol,
+                current_price,
+                3
+            )
+        )
+
+
+        # ====================================================
+        # CHEAP U-TURN FILTER
+        # ====================================================
+
+        if (
+
+            recovery
+            < UTURN_MIN_RECOVERY
+
+            or
+
+            change_1m
+            is None
+
+            or
+
+            change_3m
+            is None
+
+            or
+
+            change_1m
+            <
+            UTURN_MIN_1M_CHANGE
+
+            or
+
+            change_3m
+            <
+            UTURN_MIN_3M_CHANGE
+        ):
+
+            continue
+
+
+        # ====================================================
+        # DEEP ANALYSIS
+        # ====================================================
+
+        try:
+
+            if (
+                symbol
+                not in deep_cache
+            ):
+
+                deep_cache[
+                    symbol
+                ] = (
+                    deep_market_analysis(
+                        symbol
+                    )
+                )
+
+            analysis = (
+                deep_cache[
+                    symbol
+                ]
+            )
+
+        except Exception as exc:
+
+            print(
+                f"U-turn analysis "
+                f"failed for {symbol}:",
+                exc
+            )
+
+            continue
+
+
+        score = (
+            uturn_score(
+                recovery,
+                change_1m,
+                change_3m,
+                analysis
+            )
+        )
+
+
+        if (
+            score
+            <
+            UTURN_ALERT_SCORE
+        ):
+
+            continue
+
+
+        alerts.append({
+
+            "symbol":
+                symbol,
+
+            "current_price":
+                current_price,
+
+            "lowest_price":
+                watch[
+                    "lowest_price"
+                ],
+
+            "reference_price":
+                watch[
+                    "reference_price"
+                ],
+
+            "original_crash":
+                watch[
+                    "crash_change"
+                ],
+
+            "crash_window":
+                watch[
+                    "window_label"
+                ],
+
+            "recovery":
+                recovery,
+
+            "change_1m":
+                change_1m,
+
+            "change_3m":
+                change_3m,
+
+            "volume_ratio":
+                analysis.get(
+                    "volume_ratio"
+                ),
+
+            "buy_pressure":
+                analysis.get(
+                    "buy_pressure"
+                ),
+
+            "bid_pressure":
+                analysis.get(
+                    "bid_pressure"
+                ),
+
+            "score":
+                score,
+        })
+
+
+        # Only one U-turn alert
+        # for this crash episode.
+
+        finished.append(
+            symbol
+        )
+
+
+    for symbol in finished:
+
+        uturn_watch.pop(
+            symbol,
+            None
+        )
+
+
+    return alerts
+
+
+# ============================================================
+# SIGNAL PERFORMANCE JOURNAL
+# ============================================================
+
+def record_signal(
+    now,
+    kind,
+    symbol,
+    price,
+    extra=None
+):
+
+    entry = {
+
+        "timestamp":
+            now,
+
+        "time_uk":
+            datetime.fromtimestamp(
+                now,
+                UK_TIMEZONE
+            ).strftime(
+                "%d %b %Y %H:%M:%S"
+            ),
+
+        "kind":
+            kind,
+
+        "symbol":
+            symbol,
+
+        "price":
+            price,
+
+        "extra":
+            extra or {},
+
+        "outcomes":
+            {},
+
+        "max_price_seen":
+            price,
+
+        "min_price_seen":
+            price,
+
+        "max_change_seen":
+            0.0,
+
+        "min_change_seen":
+            0.0,
+    }
+
+
+    signal_log.append(
+        entry
+    )
+
+
+    if (
+        len(signal_log)
+        >
+        MAX_SIGNAL_LOG
+    ):
+
+        remove_count = (
+            len(signal_log)
+            -
+            MAX_SIGNAL_LOG
+        )
+
+        del signal_log[
+            :remove_count
+        ]
+
+
+def update_signal_outcomes(
+    now,
+    current_prices
+):
+
+    horizons = [
+        5,
+        15,
+        30,
+        60
+    ]
+
+
+    for entry in signal_log:
+
+        current_price = (
+            current_prices.get(
+                entry[
+                    "symbol"
+                ]
+            )
+        )
+
+
+        if not current_price:
+
+            continue
+
+
+        live_change = (
+            percent_change(
+
+                current_price,
+
+                entry[
+                    "price"
+                ]
+            )
+        )
+
+
+        entry[
+            "max_price_seen"
+        ] = max(
+
+            entry[
+                "max_price_seen"
+            ],
+
+            current_price
+        )
+
+
+        entry[
+            "min_price_seen"
+        ] = min(
+
+            entry[
+                "min_price_seen"
+            ],
+
+            current_price
+        )
+
+
+        if live_change is not None:
+
+            entry[
+                "max_change_seen"
+            ] = max(
+
+                entry[
+                    "max_change_seen"
+                ],
+
+                live_change
+            )
+
+
+            entry[
+                "min_change_seen"
+            ] = min(
+
+                entry[
+                    "min_change_seen"
+                ],
+
+                live_change
+            )
+
+
+        # Record exact checkpoints.
+
+        for minutes in horizons:
+
+            key = (
+                f"{minutes}m"
+            )
+
+
+            if (
+                key
+                in entry[
+                    "outcomes"
+                ]
+            ):
+
+                continue
+
+
+            if (
+                now
+                - entry[
+                    "timestamp"
+                ]
+                >=
+                minutes * 60
+            ):
+
+                change = (
+                    percent_change(
+
+                        current_price,
+
+                        entry[
+                            "price"
+                        ]
+                    )
+                )
+
+
+                entry[
+                    "outcomes"
+                ][
+                    key
+                ] = {
+
+                    "change":
+                        (
+                            round(
+                                change,
+                                4
+                            )
+
+                            if (
+                                change
+                                is not None
+                            )
+
+                            else None
+                        ),
+
+                    "price":
+                        current_price,
+
+                    "captured_at":
+                        now,
+                }
 
 
 # ============================================================
@@ -1271,25 +3408,32 @@ def send_telegram(
     if not TELEGRAM_BOT_TOKEN:
 
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing"
+            "TELEGRAM_BOT_TOKEN "
+            "is missing"
         )
 
 
     if not TELEGRAM_CHAT_ID:
 
         raise RuntimeError(
-            "TELEGRAM_CHAT_ID is missing"
+            "TELEGRAM_CHAT_ID "
+            "is missing"
         )
 
 
     url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/"
-        "sendMessage"
+
+        f"{TELEGRAM_API_BASE}/"
+
+        f"bot"
+        f"{TELEGRAM_BOT_TOKEN}/"
+
+        f"sendMessage"
     )
 
 
     payload = {
+
         "chat_id":
             TELEGRAM_CHAT_ID,
 
@@ -1303,23 +3447,31 @@ def send_telegram(
 
     if (
         button_url
-        and button_text
+        and
+        button_text
     ):
 
         payload[
             "reply_markup"
         ] = {
+
             "inline_keyboard": [
+
                 [
+
                     {
+
                         "text":
                             button_text,
 
                         "url":
                             button_url,
                     }
+
                 ]
+
             ]
+
         }
 
 
@@ -1330,59 +3482,22 @@ def send_telegram(
     )
 
 
-    if response.status_code != 200:
+    if (
+        response.status_code
+        != 200
+    ):
 
         raise RuntimeError(
             "Telegram error: "
-            + response.text[:500]
+            +
+            response.text[
+                :500
+            ]
         )
 
 
 # ============================================================
-# FORMATTING
-# ============================================================
-
-def format_price(
-    price
-):
-
-    if price >= 1000:
-
-        return (
-            f"${price:,.2f}"
-        )
-
-
-    if price >= 1:
-
-        return (
-            f"${price:.4f}"
-        )
-
-
-    if price >= 0.01:
-
-        return (
-            f"${price:.6f}"
-        )
-
-
-    return (
-        f"${price:.8f}"
-    )
-
-
-def current_uk_time():
-
-    return datetime.now(
-        UK_TIMEZONE
-    ).strftime(
-        "%d %b %Y %H:%M:%S"
-    )
-
-
-# ============================================================
-# NORMAL / 24H TELEGRAM SIGNAL
+# NORMAL PUMP / CRASH TELEGRAM
 # ============================================================
 
 def send_signal(
@@ -1393,11 +3508,9 @@ def send_signal(
         "direction"
     ]
 
-
     symbol = alert[
         "symbol"
     ]
-
 
     coin = coin_name(
         symbol
@@ -1405,9 +3518,18 @@ def send_signal(
 
 
     icon = (
+
         "🚀"
-        if direction == "PUMP"
-        else "🔻"
+
+        if (
+            direction
+            ==
+            "PUMP"
+        )
+
+        else
+
+        "🔻"
     )
 
 
@@ -1417,21 +3539,25 @@ def send_signal(
 
 
     change_text = (
+
         f"+{change:.2f}%"
-        if change >= 0
-        else f"{change:.2f}%"
-    )
 
+        if (
+            change
+            >= 0
+        )
 
-    title = (
-        f"{icon} "
-        f"{coin} "
-        f"{direction}"
+        else
+
+        f"{change:.2f}%"
     )
 
 
     message = (
-        f"{title}\n\n"
+
+        f"{icon} "
+        f"{coin} "
+        f"{direction}\n\n"
 
         f"Move: "
         f"{change_text}\n"
@@ -1451,18 +3577,23 @@ def send_signal(
 
 
     send_telegram(
+
         message,
+
         button_url=
             bybit_spot_url(
                 symbol
             ),
+
         button_text=
-            f"📈 Open {coin} on Bybit"
+            f"📈 Open "
+            f"{coin} "
+            f"on Bybit"
     )
 
 
 # ============================================================
-# STAIRCASE TELEGRAM SIGNAL
+# STAIRCASE TELEGRAM
 # ============================================================
 
 def send_staircase_signal(
@@ -1473,14 +3604,16 @@ def send_staircase_signal(
         "symbol"
     ]
 
-
     coin = coin_name(
         symbol
     )
 
 
     message = (
-        f"🪜 {coin} STAIRCASE\n\n"
+
+        f"🪜 "
+        f"{coin} "
+        f"STAIRCASE\n\n"
 
         f"Timeframe: "
         f"{alert['timeframe']}\n"
@@ -1509,195 +3642,193 @@ def send_staircase_signal(
         f"Detected: "
         f"{current_uk_time()} UK\n\n"
 
-        f"Early staircase pattern detected."
+        f"Early staircase "
+        f"pattern detected."
     )
 
 
     send_telegram(
+
         message,
+
         button_url=
             bybit_spot_url(
                 symbol
             ),
+
         button_text=
-            f"📈 Open {coin} on Bybit"
+            f"📈 Open "
+            f"{coin} "
+            f"on Bybit"
     )
 
 
 # ============================================================
-# MAIN DETECTOR
+# EARLY PUMP TELEGRAM
 # ============================================================
 
-def run_detector():
+def send_early_pump_signal(
+    alert
+):
 
-    global first_run
-    global last_success
-    global last_market_count
+    symbol = alert[
+        "symbol"
+    ]
 
-
-    with lock:
-
-        now = time.time()
-
-
-        (
-            current_prices,
-            daily_data,
-            endpoint
-        ) = fetch_bybit_prices()
+    coin = coin_name(
+        symbol
+    )
 
 
-        # ----------------------------
-        # 5m / 10m / 15m
-        # ----------------------------
+    if alert[
+        "strong"
+    ]:
 
-        alerts = detect_signals(
-            now,
-            current_prices
+        title_icon = "🔥"
+
+        title_text = (
+            "STRONG EARLY PUMP"
+        )
+
+    else:
+
+        title_icon = "⚡"
+
+        title_text = (
+            "EARLY PUMP"
         )
 
 
-        # ----------------------------
-        # 24 HOURS
-        # ----------------------------
+    message = (
 
-        alerts.extend(
-            detect_24h_signals(
-                daily_data
-            )
-        )
+        f"{title_icon} "
+        f"{coin} "
+        f"{title_text}\n\n"
 
+        f"Score: "
+        f"{alert['score']}/100\n\n"
 
-        # ----------------------------
-        # SAVE CURRENT SNAPSHOT
-        # ----------------------------
+        f"1m: "
+        f"{fmt_optional_percent(alert['change_1m'])}\n"
 
-        save_snapshot(
-            now,
-            current_prices
-        )
+        f"3m: "
+        f"{fmt_optional_percent(alert['change_3m'])}\n"
 
+        f"5m: "
+        f"{fmt_optional_percent(alert['change_5m'])}\n\n"
 
-        # ----------------------------
-        # STAIRCASE
-        # ----------------------------
+        f"Volume: "
+        f"{fmt_optional_ratio(alert.get('volume_ratio'))} "
+        f"normal\n"
 
-        staircase_alerts = (
-            detect_staircases(
-                now
-            )
-        )
+        f"Buy pressure: "
+        f"{fmt_optional_pressure(alert.get('buy_pressure'))}\n"
 
+        f"Order-book bids: "
+        f"{fmt_optional_pressure(alert.get('bid_pressure'))}\n\n"
 
-        last_success = now
+        f"Current: "
+        f"{format_price(alert['current_price'])}\n\n"
 
-        last_market_count = (
-            len(current_prices)
-        )
+        f"Detected: "
+        f"{current_uk_time()} UK\n\n"
 
-
-        # ----------------------------
-        # STARTUP MESSAGE
-        # ----------------------------
-
-        if first_run:
-
-            send_telegram(
-                "✅ SIGNAL WATCH ONLINE\n\n"
-
-                f"Bybit connection: OK\n"
-
-                f"USDT Spot markets: "
-                f"{len(current_prices)}\n\n"
-
-                "Pump / Crash:\n"
-
-                "5 min: ±10%\n"
-                "10 min: ±15%\n"
-                "15 min: ±20%\n"
-                "24 hours: ±30%\n\n"
-
-                "🪜 15m Staircase detector enabled.\n\n"
-
-                "5/10/15 minute monitoring "
-                "warms up within about "
-                "15 minutes.\n"
-
-                "The staircase detector needs "
-                "roughly 75–90 minutes of "
-                "history after a restart."
-            )
+        f"Early unusual activity detected."
+    )
 
 
-            first_run = False
+    send_telegram(
+
+        message,
+
+        button_url=
+            bybit_spot_url(
+                symbol
+            ),
+
+        button_text=
+            f"📈 Open "
+            f"{coin} "
+            f"on Bybit"
+    )
 
 
-        # ----------------------------
-        # SEND NORMAL SIGNALS
-        # ----------------------------
+# ============================================================
+# U-TURN TELEGRAM
+# ============================================================
 
-        for alert in alerts:
+def send_uturn_signal(
+    alert
+):
 
-            try:
+    symbol = alert[
+        "symbol"
+    ]
 
-                send_signal(
-                    alert
-                )
-
-            except Exception as exc:
-
-                print(
-                    "Telegram signal error:",
-                    exc
-                )
+    coin = coin_name(
+        symbol
+    )
 
 
-        # ----------------------------
-        # SEND STAIRCASE SIGNALS
-        # ----------------------------
+    message = (
 
-        for alert in staircase_alerts:
+        f"🔄 "
+        f"{coin} "
+        f"U-TURN\n\n"
 
-            try:
+        f"Score: "
+        f"{alert['score']}/100\n\n"
 
-                send_staircase_signal(
-                    alert
-                )
+        f"Original crash: "
+        f"{alert['original_crash']:.2f}% "
+        f"({alert['crash_window']})\n"
 
-            except Exception as exc:
+        f"Bottom: "
+        f"{format_price(alert['lowest_price'])}\n"
 
-                print(
-                    "Telegram staircase error:",
-                    exc
-                )
+        f"Recovery from bottom: "
+        f"+{alert['recovery']:.2f}%\n\n"
+
+        f"1m: "
+        f"{fmt_optional_percent(alert['change_1m'])}\n"
+
+        f"3m: "
+        f"{fmt_optional_percent(alert['change_3m'])}\n"
+
+        f"Volume: "
+        f"{fmt_optional_ratio(alert.get('volume_ratio'))} "
+        f"normal\n"
+
+        f"Buy pressure: "
+        f"{fmt_optional_pressure(alert.get('buy_pressure'))}\n"
+
+        f"Order-book bids: "
+        f"{fmt_optional_pressure(alert.get('bid_pressure'))}\n\n"
+
+        f"Current: "
+        f"{format_price(alert['current_price'])}\n\n"
+
+        f"Detected: "
+        f"{current_uk_time()} UK\n\n"
+
+        f"Possible crash reversal detected."
+    )
 
 
-        return {
-            "success":
-                True,
+    send_telegram(
 
-            "markets":
-                len(current_prices),
+        message,
 
-            "endpoint":
-                endpoint,
+        button_url=
+            bybit_spot_url(
+                symbol
+            ),
 
-            "history_snapshots":
-                len(history),
-
-            "pump_crash_signals":
-                len(alerts),
-
-            "staircase_signals":
-                len(
-                    staircase_alerts
-                ),
-
-            "warmup":
-                get_warmup_status(
-                    now
-                ),
-        }
+        button_text=
+            f"📈 Open "
+            f"{coin} "
+            f"on Bybit"
+    )
 
 
 # ============================================================
@@ -1716,10 +3847,31 @@ def get_warmup_status(
     if not history:
 
         return {
-            "5m": False,
-            "10m": False,
-            "15m": False,
-            "24h": True,
+
+            "1m":
+                False,
+
+            "3m":
+                False,
+
+            "5m":
+                False,
+
+            "10m":
+                False,
+
+            "15m":
+                False,
+
+            "24h":
+                True,
+
+            "early_pump":
+                False,
+
+            "uturn":
+                False,
+
             "staircase_15m":
                 False,
         }
@@ -1727,50 +3879,556 @@ def get_warmup_status(
 
     oldest_age = (
         now
-        - history[0][
+        - history[
+            0
+        ][
             "timestamp"
         ]
     )
 
 
     return {
+
+        "1m":
+            (
+                oldest_age
+                >=
+                1 * 60
+            ),
+
+        "3m":
+            (
+                oldest_age
+                >=
+                3 * 60
+            ),
+
         "5m":
-            oldest_age
-            >= 5 * 60,
+            (
+                oldest_age
+                >=
+                5 * 60
+            ),
 
         "10m":
-            oldest_age
-            >= 10 * 60,
+            (
+                oldest_age
+                >=
+                10 * 60
+            ),
 
         "15m":
-            oldest_age
-            >= 15 * 60,
+            (
+                oldest_age
+                >=
+                15 * 60
+            ),
 
-        # Uses Bybit's own 24h data,
-        # so it needs no local warmup.
         "24h":
             True,
 
-        # 90 minutes is a conservative
-        # indication that five completed
-        # 15m candles are available.
+        "early_pump":
+            (
+                oldest_age
+                >=
+                5 * 60
+            ),
+
+        "uturn":
+            (
+                oldest_age
+                >=
+                3 * 60
+            ),
+
         "staircase_15m":
-            oldest_age
-            >= 90 * 60,
+            (
+                oldest_age
+                >=
+                90 * 60
+            ),
     }
 
 
 # ============================================================
-# WEB ROUTES
+# MAIN DETECTOR
+# ============================================================
+
+def run_detector():
+
+    global first_run
+
+    global last_success
+
+    global last_market_count
+
+
+    with lock:
+
+        now = time.time()
+
+
+        # Cache deeper analysis so
+        # Early Pump and U-Turn do
+        # not request the same coin twice.
+
+        deep_cache = {}
+
+
+        (
+            current_prices,
+            daily_data,
+            endpoint
+        ) = fetch_bybit_prices()
+
+
+        # ====================================================
+        # NORMAL PUMP / CRASH
+        # ====================================================
+
+        alerts = (
+            detect_signals(
+                now,
+                current_prices
+            )
+        )
+
+
+        alerts.extend(
+
+            detect_24h_signals(
+                daily_data
+            )
+
+        )
+
+
+        # ====================================================
+        # CRASH -> U-TURN WATCH
+        # ====================================================
+
+        for alert in alerts:
+
+            if (
+                alert[
+                    "direction"
+                ]
+                ==
+                "CRASH"
+            ):
+
+                register_crash_for_uturn(
+                    alert,
+                    now
+                )
+
+
+        # ====================================================
+        # EARLY PUMP
+        # ====================================================
+
+        early_alerts = (
+            detect_early_pumps(
+                now,
+                current_prices,
+                deep_cache
+            )
+        )
+
+
+        # ====================================================
+        # U-TURN
+        # ====================================================
+
+        uturn_alerts = (
+            detect_uturns(
+                now,
+                current_prices,
+                deep_cache
+            )
+        )
+
+
+        # ====================================================
+        # SAVE CURRENT SNAPSHOT
+        # ====================================================
+
+        save_snapshot(
+            now,
+            current_prices
+        )
+
+
+        # ====================================================
+        # STAIRCASE
+        # ====================================================
+
+        staircase_alerts = (
+            detect_staircases(
+                now
+            )
+        )
+
+
+        # ====================================================
+        # UPDATE OLD SIGNAL RESULTS
+        # ====================================================
+
+        update_signal_outcomes(
+            now,
+            current_prices
+        )
+
+
+        last_success = now
+
+        last_market_count = (
+            len(
+                current_prices
+            )
+        )
+
+
+        # ====================================================
+        # STARTUP MESSAGE
+        # ====================================================
+
+        if first_run:
+
+            send_telegram(
+
+                "✅ SIGNAL WATCH V2 ONLINE\n\n"
+
+                f"Bybit connection: OK\n"
+
+                f"USDT Spot markets: "
+                f"{len(current_prices)}\n\n"
+
+                "Large Pump / Crash:\n"
+
+                "5 min: ±10%\n"
+
+                "10 min: ±15%\n"
+
+                "15 min: ±20%\n"
+
+                "24 hours: ±30%\n\n"
+
+                "⚡ Early Pump: enabled\n"
+
+                "🔄 U-Turn: enabled\n"
+
+                "🪜 Staircase: enabled\n\n"
+
+                "1/3/5 minute history "
+                "warms up during the "
+                "first few minutes.\n"
+
+                "Staircase needs roughly "
+                "75–90 minutes after "
+                "a restart."
+            )
+
+
+            first_run = False
+
+
+        # ====================================================
+        # SEND NORMAL SIGNALS
+        # ====================================================
+
+        for alert in alerts:
+
+            try:
+
+                send_signal(
+                    alert
+                )
+
+
+                record_signal(
+
+                    now,
+
+                    alert[
+                        "direction"
+                    ],
+
+                    alert[
+                        "symbol"
+                    ],
+
+                    alert[
+                        "current_price"
+                    ],
+
+                    {
+
+                        "window":
+                            alert[
+                                "window_label"
+                            ],
+
+                        "change":
+                            alert[
+                                "change"
+                            ],
+                    }
+                )
+
+
+            except Exception as exc:
+
+                print(
+                    "Telegram normal "
+                    "signal error:",
+                    exc
+                )
+
+
+        # ====================================================
+        # SEND EARLY PUMP SIGNALS
+        # ====================================================
+
+        for alert in early_alerts:
+
+            try:
+
+                send_early_pump_signal(
+                    alert
+                )
+
+
+                record_signal(
+
+                    now,
+
+                    "EARLY_PUMP",
+
+                    alert[
+                        "symbol"
+                    ],
+
+                    alert[
+                        "current_price"
+                    ],
+
+                    {
+
+                        "score":
+                            alert[
+                                "score"
+                            ],
+
+                        "change_1m":
+                            alert[
+                                "change_1m"
+                            ],
+
+                        "change_3m":
+                            alert[
+                                "change_3m"
+                            ],
+
+                        "change_5m":
+                            alert[
+                                "change_5m"
+                            ],
+
+                        "volume_ratio":
+                            alert.get(
+                                "volume_ratio"
+                            ),
+
+                        "buy_pressure":
+                            alert.get(
+                                "buy_pressure"
+                            ),
+
+                        "bid_pressure":
+                            alert.get(
+                                "bid_pressure"
+                            ),
+                    }
+                )
+
+
+            except Exception as exc:
+
+                print(
+                    "Telegram early-pump "
+                    "error:",
+                    exc
+                )
+
+
+        # ====================================================
+        # SEND U-TURN SIGNALS
+        # ====================================================
+
+        for alert in uturn_alerts:
+
+            try:
+
+                send_uturn_signal(
+                    alert
+                )
+
+
+                record_signal(
+
+                    now,
+
+                    "UTURN",
+
+                    alert[
+                        "symbol"
+                    ],
+
+                    alert[
+                        "current_price"
+                    ],
+
+                    {
+
+                        "score":
+                            alert[
+                                "score"
+                            ],
+
+                        "recovery":
+                            alert[
+                                "recovery"
+                            ],
+
+                        "original_crash":
+                            alert[
+                                "original_crash"
+                            ],
+                    }
+                )
+
+
+            except Exception as exc:
+
+                print(
+                    "Telegram U-turn "
+                    "error:",
+                    exc
+                )
+
+
+        # ====================================================
+        # SEND STAIRCASE SIGNALS
+        # ====================================================
+
+        for alert in staircase_alerts:
+
+            try:
+
+                send_staircase_signal(
+                    alert
+                )
+
+
+                record_signal(
+
+                    now,
+
+                    "STAIRCASE",
+
+                    alert[
+                        "symbol"
+                    ],
+
+                    alert[
+                        "current_price"
+                    ],
+
+                    {
+
+                        "rise":
+                            alert[
+                                "total_rise"
+                            ],
+                    }
+                )
+
+
+            except Exception as exc:
+
+                print(
+                    "Telegram staircase "
+                    "error:",
+                    exc
+                )
+
+
+        # ====================================================
+        # RETURN STATUS
+        # ====================================================
+
+        return {
+
+            "success":
+                True,
+
+            "markets":
+                len(
+                    current_prices
+                ),
+
+            "endpoint":
+                endpoint,
+
+            "history_snapshots":
+                len(
+                    history
+                ),
+
+            "pump_crash_signals":
+                len(
+                    alerts
+                ),
+
+            "early_pump_signals":
+                len(
+                    early_alerts
+                ),
+
+            "uturn_signals":
+                len(
+                    uturn_alerts
+                ),
+
+            "staircase_signals":
+                len(
+                    staircase_alerts
+                ),
+
+            "uturn_watches":
+                len(
+                    uturn_watch
+                ),
+
+            "deep_scans":
+                len(
+                    deep_cache
+                ),
+
+            "warmup":
+                get_warmup_status(
+                    now
+                ),
+        }
+
+
+# ============================================================
+# HOME / STATUS PAGE
 # ============================================================
 
 @app.route("/")
 def home():
-
-    warmup = (
-        get_warmup_status()
-    )
-
 
     last_run_text = None
 
@@ -1778,18 +4436,21 @@ def home():
     if last_success:
 
         last_run_text = (
+
             datetime.fromtimestamp(
                 last_success,
                 UK_TIMEZONE
             ).strftime(
                 "%d %b %Y %H:%M:%S"
             )
+
         )
 
 
     return jsonify({
+
         "service":
-            "Signal Watch",
+            "Signal Watch V2",
 
         "status":
             "online",
@@ -1798,15 +4459,19 @@ def home():
             last_market_count,
 
         "history_snapshots":
-            len(history),
+            len(
+                history
+            ),
 
         "last_success_uk":
             last_run_text,
 
         "warmup":
-            warmup,
+            get_warmup_status(),
+
 
         "thresholds": {
+
             "5_min":
                 "±10%",
 
@@ -1820,7 +4485,69 @@ def home():
                 "±30%",
         },
 
+
+        "early_pump": {
+
+            "status":
+                "enabled",
+
+            "prefilter_1m":
+                (
+                    f"+"
+                    f"{EARLY_PREFILTER_1M}%"
+                ),
+
+            "prefilter_3m":
+                (
+                    f"+"
+                    f"{EARLY_PREFILTER_3M}%"
+                ),
+
+            "prefilter_5m":
+                (
+                    f"+"
+                    f"{EARLY_PREFILTER_5M}%"
+                ),
+
+            "alert_score":
+                EARLY_ALERT_SCORE,
+
+            "strong_score":
+                EARLY_STRONG_SCORE,
+
+            "max_deep_scans_per_run":
+                MAX_DEEP_SCANS_PER_RUN,
+        },
+
+
+        "uturn": {
+
+            "status":
+                "enabled",
+
+            "watch_hours":
+                (
+                    UTURN_WATCH_SECONDS
+                    / 3600
+                ),
+
+            "minimum_recovery":
+                (
+                    f"{UTURN_MIN_RECOVERY}%"
+                ),
+
+            "alert_score":
+                UTURN_ALERT_SCORE,
+
+            "active_watches":
+                len(
+                    uturn_watch
+                ),
+        },
+
+
         "staircase": {
+
             "timeframe":
                 "15m",
 
@@ -1839,8 +4566,18 @@ def home():
             "rise_range":
                 "2.5% to 12%",
         },
+
+
+        "signal_log_entries":
+            len(
+                signal_log
+            ),
     })
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 @app.route("/run")
 def run():
@@ -1850,7 +4587,6 @@ def run():
         result = (
             run_detector()
         )
-
 
         return jsonify(
             result
@@ -1864,24 +4600,37 @@ def run():
             exc
         )
 
-
         return jsonify({
+
             "success":
                 False,
 
             "error":
-                str(exc),
+                str(
+                    exc
+                ),
+
         }), 500
 
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.route("/health")
 def health():
 
     return jsonify({
+
         "status":
             "OK"
+
     }), 200
 
+
+# ============================================================
+# TELEGRAM TEST
+# ============================================================
 
 @app.route("/telegram-test")
 def telegram_test():
@@ -1889,14 +4638,20 @@ def telegram_test():
     try:
 
         send_telegram(
-            "🧪 TELEGRAM TEST\n\n"
-            "Signal Watch is connected "
-            "correctly.\n\n"
-            "5 min: ±10%\n"
-            "10 min: ±15%\n"
-            "15 min: ±20%\n"
-            "24 hours: ±30%\n\n"
-            "🪜 Staircase: 15m",
+
+            "🧪 TELEGRAM TEST — SIGNAL WATCH V2\n\n"
+
+            "Telegram: OK\n"
+
+            "Bybit chart button: ready\n\n"
+
+            "🚀 Pump / 🔻 Crash: enabled\n"
+
+            "⚡ Early Pump: enabled\n"
+
+            "🔄 U-Turn: enabled\n"
+
+            "🪜 Staircase: enabled",
 
             button_url=
                 bybit_spot_url(
@@ -1909,20 +4664,45 @@ def telegram_test():
 
 
         return jsonify({
+
             "success":
                 True,
 
             "message":
                 "Telegram test sent",
+
         })
 
 
     except Exception as exc:
 
         return jsonify({
+
             "success":
                 False,
 
             "error":
-                str(exc),
+                str(
+                    exc
+                ),
+
         }), 500
+
+
+# ============================================================
+# LOCAL START
+# ============================================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
