@@ -172,7 +172,7 @@ def bybit_spot_url(symbol):
         "bybitapp://open/home?"
         "tab=3"
         "&tabName=margin"
-        "&page=trading"
+        "&page=market"
         f"&symbol={symbol}"
     )
 
