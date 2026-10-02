@@ -167,17 +167,24 @@ def coin_name(symbol):
 
 
 def bybit_spot_url(symbol):
-    """
-    Create the Bybit UK Spot trading URL.
-    """
-    coin = quote(
-        coin_name(symbol),
-        safe=""
+
+    native_route = (
+        "bybitapp://open/home?"
+        "tab=3"
+        "&tabName=margin"
+        "&page=trading"
+        f"&symbol={symbol}"
+    )
+
+    fallback_url = (
+        "https://www.bybit.com/"
+        f"en-GB/trade/spot/{coin_name(symbol)}/USDT"
     )
 
     return (
-        "https://www.bybit.com/"
-        f"en-GB/trade/spot/{coin}/USDT"
+        "https://app.bybit.com/inapp"
+        f"?by_dp={quote(native_route, safe='')}"
+        f"&by_web_link={quote(fallback_url, safe='')}"
     )
 
 
