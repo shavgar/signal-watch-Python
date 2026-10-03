@@ -72,7 +72,7 @@ WINDOWS = {
 
 DAILY_THRESHOLD = 30.0
 
-REARM_MARGIN = 2.0
+REARM_BUFFER = 2.0
 
 
 # ============================================================
@@ -349,30 +349,13 @@ def coin_name(symbol):
 def bybit_spot_url(symbol):
 
     """
-    Telegram button -> Bybit app
-    -> coin candle / market page.
+    Spot-only Bybit market link.
     """
 
-    native_route = (
-        "bybitapp://open/home?"
-        "tab=3"
-        "&tabName=margin"
-        "&page=market"
-        f"&symbol={symbol}"
-    )
-
-    fallback_url = (
+    return (
         "https://www.bybit.com/"
         f"en-GB/trade/spot/"
         f"{coin_name(symbol)}/USDT"
-    )
-
-    return (
-        "https://app.bybit.com/inapp"
-        f"?by_dp="
-        f"{quote(native_route, safe='')}"
-        f"&by_web_link="
-        f"{quote(fallback_url, safe='')}"
     )
 
 
@@ -960,7 +943,7 @@ def detect_signals(
                 <= max(
                     0,
                     threshold
-                    - REARM_MARGIN
+                    - REARM_BUFFER
                 )
             ):
 
@@ -1095,7 +1078,7 @@ def detect_24h_signals(
             abs(change)
             <= (
                 DAILY_THRESHOLD
-                - REARM_MARGIN
+                - REARM_BUFFER
             )
         ):
 
