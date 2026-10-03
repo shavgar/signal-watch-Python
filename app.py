@@ -354,7 +354,7 @@ def bybit_spot_url(symbol):
 
     return (
         "https://www.bybit.com/"
-        f"en-GB/trade/spot/"
+        f"en/trade/spot/"
         f"{coin_name(symbol)}/USDT"
     )
 
