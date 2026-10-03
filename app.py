@@ -76,36 +76,45 @@ HISTORY_KEEP_SECONDS = 3 * 60 * 60
 REFERENCE_TOLERANCE_SECONDS = 90
 
 
-# ============================================================
-# STAIRCASE
-# ============================================================
+# ------------------------------------------------------------
+# STAIRCASE + BREAKOUT DETECTOR
+# ------------------------------------------------------------
 
 STAIRCASE_TIMEFRAME_MINUTES = 15
 
+# We will analyse 5 completed 15m candles:
+# first 4 = staircase
+# last 1 = breakout
 STAIRCASE_CANDLES = 5
 
-STAIRCASE_MIN_GREEN_CANDLES = 4
+# First 4 candles should mostly be green
+STAIR_STEP_GREEN_MIN = 3
 
-STAIRCASE_MIN_HIGHER_CLOSES = 4
+# First 4 candles should show higher closes / higher lows
+STAIR_STEP_HIGHER_CLOSES_MIN = 3
+STAIR_STEP_HIGHER_LOWS_MIN = 3
 
-STAIRCASE_MIN_HIGHER_LOWS = 3
+# Total rise across the first 4 stair candles
+STAIR_STEP_MIN_TOTAL_RISE = 1.0
+STAIR_STEP_MAX_TOTAL_RISE = 8.0
 
-STAIRCASE_MIN_TOTAL_RISE = 2.5
+# Stair candles should stay relatively small
+STAIR_STEP_MAX_BODY = 2.2
+STAIR_STEP_MAX_RANGE = 3.5
 
-STAIRCASE_MAX_TOTAL_RISE = 12.0
+# Breakout candle should be clearly bigger
+BREAKOUT_MIN_BODY = 3.0
+BREAKOUT_MAX_BODY = 12.0
+BREAKOUT_MIN_MULTIPLIER = 1.8   # breakout body vs average stair body
 
-STAIRCASE_MAX_CANDLE_BODY = 4.0
+# The breakout candle should close above all previous stair highs
+BREAKOUT_MUST_CLOSE_ABOVE_PREVIOUS_HIGHS = True
 
-STAIRCASE_MAX_CANDLE_RANGE = 6.0
-
-STAIRCASE_MAX_RED_BODY = 1.5
-
+# Enough 1-minute samples per synthetic 15m candle
 STAIRCASE_MIN_SAMPLES_PER_CANDLE = 8
 
-STAIRCASE_COOLDOWN_SECONDS = (
-    2 * 60 * 60
-)
-
+# Avoid repeated alerts
+STAIRCASE_COOLDOWN_SECONDS = 2 * 60 * 60
 
 # ============================================================
 # EARLY PUMP
@@ -1209,240 +1218,120 @@ def build_completed_15m_candles(
 # STAIRCASE METRICS
 # ============================================================
 
-def staircase_metrics(
-    candles
-):
+def staircase_metrics(candles):
+    """
+    candles = 5 completed 15m candles
+    first 4 = staircase
+    last 1 = breakout
+    """
 
-    green_candles = sum(
+    stair = candles[:-1]
+    breakout = candles[-1]
 
-        1
-
-        for candle
-        in candles
-
-        if (
-            candle[
-                "close"
-            ]
-            >
-            candle[
-                "open"
-            ]
-        )
+    stair_green = sum(
+        1 for candle in stair
+        if candle["close"] > candle["open"]
     )
 
-    higher_closes = sum(
-
-        1
-
-        for index
-        in range(
-            1,
-            len(candles)
-        )
-
-        if (
-            candles[
-                index
-            ][
-                "close"
-            ]
-            >
-            candles[
-                index - 1
-            ][
-                "close"
-            ]
-        )
+    stair_higher_closes = sum(
+        1 for i in range(1, len(stair))
+        if stair[i]["close"] > stair[i - 1]["close"]
     )
 
-    higher_lows = sum(
-
-        1
-
-        for index
-        in range(
-            1,
-            len(candles)
-        )
-
-        if (
-            candles[
-                index
-            ][
-                "low"
-            ]
-            >
-            candles[
-                index - 1
-            ][
-                "low"
-            ]
-        )
+    stair_higher_lows = sum(
+        1 for i in range(1, len(stair))
+        if stair[i]["low"] > stair[i - 1]["low"]
     )
 
-    first_open = (
-        candles[
-            0
-        ][
-            "open"
-        ]
-    )
+    stair_first_open = stair[0]["open"]
+    stair_last_close = stair[-1]["close"]
 
-    last_close = (
-        candles[
-            -1
-        ][
-            "close"
-        ]
-    )
+    stair_total_rise = (
+        (stair_last_close - stair_first_open) / stair_first_open
+    ) * 100
 
-    total_rise = (
-        percent_change(
-            last_close,
-            first_open
-        )
-    )
+    stair_bodies = []
+    stair_ranges = []
 
-    body_changes = []
-
-    candle_ranges = []
-
-    for candle in candles:
-
+    for candle in stair:
         body = (
-            percent_change(
-                candle[
-                    "close"
-                ],
-                candle[
-                    "open"
-                ]
-            )
-        )
+            (candle["close"] - candle["open"]) / candle["open"]
+        ) * 100
 
-        candle_range = (
-            percent_change(
-                candle[
-                    "high"
-                ],
-                candle[
-                    "low"
-                ]
-            )
-        )
+        rng = (
+            (candle["high"] - candle["low"]) / candle["low"]
+        ) * 100
 
-        body_changes.append(
-            body
-        )
+        stair_bodies.append(abs(body))
+        stair_ranges.append(rng)
 
-        candle_ranges.append(
-            candle_range
-        )
+    avg_stair_body = (
+        sum(stair_bodies) / len(stair_bodies)
+        if stair_bodies else 0
+    )
+
+    breakout_body = (
+        (breakout["close"] - breakout["open"]) / breakout["open"]
+    ) * 100
+
+    breakout_range = (
+        (breakout["high"] - breakout["low"]) / breakout["low"]
+    ) * 100
+
+    previous_highs = [c["high"] for c in stair]
+    max_previous_high = max(previous_highs) if previous_highs else 0
+
+    breakout_closes_above_previous_high = (
+        breakout["close"] > max_previous_high
+    )
+
+    breakout_multiplier = (
+        abs(breakout_body) / avg_stair_body
+        if avg_stair_body > 0 else 0
+    )
 
     return {
-
-        "green_candles":
-            green_candles,
-
-        "higher_closes":
-            higher_closes,
-
-        "higher_lows":
-            higher_lows,
-
-        "total_rise":
-            total_rise,
-
-        "max_body":
-            max(
-                abs(x)
-                for x
-                in body_changes
-            ),
-
-        "largest_red_body":
-            abs(
-                min(
-                    min(
-                        body_changes
-                    ),
-                    0
-                )
-            ),
-
-        "max_range":
-            max(
-                candle_ranges
-            ),
-
-        "current_price":
-            last_close,
+        "stair_green": stair_green,
+        "stair_higher_closes": stair_higher_closes,
+        "stair_higher_lows": stair_higher_lows,
+        "stair_total_rise": stair_total_rise,
+        "stair_avg_body": avg_stair_body,
+        "stair_max_body": max(stair_bodies) if stair_bodies else 0,
+        "stair_max_range": max(stair_ranges) if stair_ranges else 0,
+        "breakout_body": breakout_body,
+        "breakout_range": breakout_range,
+        "breakout_multiplier": breakout_multiplier,
+        "breakout_closes_above_previous_high":
+            breakout_closes_above_previous_high,
+        "current_price": breakout["close"],
     }
 
 
-def qualifies_as_staircase(
-    metrics
-):
-
-    return (
-
-        metrics[
-            "green_candles"
-        ]
-        >=
-        STAIRCASE_MIN_GREEN_CANDLES
-
-        and
-
-        metrics[
-            "higher_closes"
-        ]
-        >=
-        STAIRCASE_MIN_HIGHER_CLOSES
-
-        and
-
-        metrics[
-            "higher_lows"
-        ]
-        >=
-        STAIRCASE_MIN_HIGHER_LOWS
-
-        and
-
-        STAIRCASE_MIN_TOTAL_RISE
-        <=
-        metrics[
-            "total_rise"
-        ]
-        <=
-        STAIRCASE_MAX_TOTAL_RISE
-
-        and
-
-        metrics[
-            "max_body"
-        ]
-        <=
-        STAIRCASE_MAX_CANDLE_BODY
-
-        and
-
-        metrics[
-            "max_range"
-        ]
-        <=
-        STAIRCASE_MAX_CANDLE_RANGE
-
-        and
-
-        metrics[
-            "largest_red_body"
-        ]
-        <=
-        STAIRCASE_MAX_RED_BODY
+def qualifies_as_staircase(metrics):
+    # 1) First 4 candles = staircase
+    staircase_ok = (
+        metrics["stair_green"] >= STAIR_STEP_GREEN_MIN
+        and metrics["stair_higher_closes"] >= STAIR_STEP_HIGHER_CLOSES_MIN
+        and metrics["stair_higher_lows"] >= STAIR_STEP_HIGHER_LOWS_MIN
+        and STAIR_STEP_MIN_TOTAL_RISE <= metrics["stair_total_rise"] <= STAIR_STEP_MAX_TOTAL_RISE
+        and metrics["stair_max_body"] <= STAIR_STEP_MAX_BODY
+        and metrics["stair_max_range"] <= STAIR_STEP_MAX_RANGE
     )
+
+    # 2) Last candle = breakout
+    breakout_ok = (
+        metrics["breakout_body"] >= BREAKOUT_MIN_BODY
+        and metrics["breakout_body"] <= BREAKOUT_MAX_BODY
+        and metrics["breakout_multiplier"] >= BREAKOUT_MIN_MULTIPLIER
+    )
+
+    if BREAKOUT_MUST_CLOSE_ABOVE_PREVIOUS_HIGHS:
+        breakout_ok = (
+            breakout_ok
+            and metrics["breakout_closes_above_previous_high"]
+        )
+
+    return staircase_ok and breakout_ok
 
 
 def detect_staircases(
@@ -1507,42 +1396,17 @@ def detect_staircases(
 
         alerts.append({
 
-            "symbol":
-                symbol,
-
-            "direction":
-                "STAIRCASE",
-
-            "timeframe":
-                "15m",
-
-            "candles":
-                STAIRCASE_CANDLES,
-
-            "green_candles":
-                metrics[
-                    "green_candles"
-                ],
-
-            "higher_closes":
-                metrics[
-                    "higher_closes"
-                ],
-
-            "higher_lows":
-                metrics[
-                    "higher_lows"
-                ],
-
-            "total_rise":
-                metrics[
-                    "total_rise"
-                ],
-
-            "current_price":
-                metrics[
-                    "current_price"
-                ],
+            "symbol": symbol,
+            "direction": "STAIRCASE",
+            "timeframe": "15m",
+            "candles": STAIRCASE_CANDLES,
+            "stair_green": metrics["stair_green"],
+            "stair_higher_closes": metrics["stair_higher_closes"],
+            "stair_higher_lows": metrics["stair_higher_lows"],
+            "stair_total_rise": metrics["stair_total_rise"],
+            "breakout_body": metrics["breakout_body"],
+            "breakout_multiplier": metrics["breakout_multiplier"],
+            "current_price": metrics["current_price"],
         })
 
         staircase_last_alert[
@@ -3596,72 +3460,29 @@ def send_signal(
 # STAIRCASE TELEGRAM
 # ============================================================
 
-def send_staircase_signal(
-    alert
-):
-
-    symbol = alert[
-        "symbol"
-    ]
-
-    coin = coin_name(
-        symbol
-    )
-
+def send_staircase_signal(alert):
+    symbol = alert["symbol"]
+    coin = coin_name(symbol)
 
     message = (
-
-        f"🪜 "
-        f"{coin} "
-        f"STAIRCASE\n\n"
-
-        f"Timeframe: "
-        f"{alert['timeframe']}\n"
-
-        f"Candles analysed: "
-        f"{alert['candles']}\n"
-
-        f"Rise: "
-        f"+{alert['total_rise']:.2f}%\n"
-
-        f"Green candles: "
-        f"{alert['green_candles']}/"
-        f"{alert['candles']}\n"
-
-        f"Higher closes: "
-        f"{alert['higher_closes']}/"
-        f"{alert['candles'] - 1}\n"
-
-        f"Higher lows: "
-        f"{alert['higher_lows']}/"
-        f"{alert['candles'] - 1}\n\n"
-
-        f"Current: "
-        f"{format_price(alert['current_price'])}\n\n"
-
-        f"Detected: "
-        f"{current_uk_time()} UK\n\n"
-
-        f"Early staircase "
-        f"pattern detected."
+        f"🪜 {coin} STAIR + BREAKOUT\n\n"
+        f"Timeframe: {alert['timeframe']}\n"
+        f"Pattern: 4 stair candles + 1 breakout candle\n\n"
+        f"Stair rise: +{alert['stair_total_rise']:.2f}%\n"
+        f"Green stair candles: {alert['stair_green']}/4\n"
+        f"Higher closes: {alert['stair_higher_closes']}/3\n"
+        f"Higher lows: {alert['stair_higher_lows']}/3\n\n"
+        f"Breakout candle body: +{alert['breakout_body']:.2f}%\n"
+        f"Breakout strength: {alert['breakout_multiplier']:.2f}x stair average\n"
+        f"Current: {format_price(alert['current_price'])}\n\n"
+        f"Detected: {current_uk_time()} UK"
     )
-
 
     send_telegram(
-
         message,
-
-        button_url=
-            bybit_spot_url(
-                symbol
-            ),
-
-        button_text=
-            f"📈 Open "
-            f"{coin} "
-            f"on Bybit"
+        button_url=bybit_spot_url(symbol),
+        button_text=f"📈 Open {coin} on Bybit"
     )
-
 
 # ============================================================
 # EARLY PUMP TELEGRAM
