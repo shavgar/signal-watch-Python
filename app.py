@@ -359,7 +359,7 @@ def bybit_spot_url(symbol):
     # Browser fallback if the app cannot handle the link.
     web_url = (
         "https://www.bybit.com/"
-        f"en-GB/trade/spot/{coin}/USDT"
+        f"en/trade/spot/{coin}/USDT"
     )
 
     return (
