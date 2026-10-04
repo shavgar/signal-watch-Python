@@ -347,15 +347,25 @@ def coin_name(symbol):
 
 
 def bybit_spot_url(symbol):
+    coin = coin_name(symbol)
 
-    """
-    Spot-only Bybit market link.
-    """
+    # Direct instruction for the Bybit app:
+    # Open Spot trading for this exact pair.
+    deep_link = (
+        "bybitapp://open/home?"
+        f"tab=3&tabName=margin&page=trading&symbol={symbol}"
+    )
+
+    # Browser fallback if the app cannot handle the link.
+    web_url = (
+        "https://www.bybit.com/"
+        f"en-GB/trade/spot/{coin}/USDT"
+    )
 
     return (
-        "https://www.bybit.com/"
-        f"en/trade/spot/"
-        f"{coin_name(symbol)}/USDT"
+        "https://app.bybit.com/inapp"
+        f"?by_dp={quote(deep_link, safe='')}"
+        f"&by_web_link={quote(web_url, safe='')}"
     )
 
 
