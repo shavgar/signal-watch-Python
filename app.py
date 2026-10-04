@@ -349,14 +349,14 @@ def coin_name(symbol):
 def bybit_spot_url(symbol):
     coin = coin_name(symbol)
 
-    # Direct instruction for the Bybit app:
-    # Open Spot trading for this exact pair.
+    # Open the market-detail/chart page for this coin
+    # instead of the Buy/Sell trading-entry screen.
     deep_link = (
-        "bybitapp://open/home?"
-        f"tab=3&tabName=margin&page=trading&symbol={symbol}"
+        "bybitapp://open/market/detail?"
+        f"symbol={symbol}"
     )
 
-    # Browser fallback if the app cannot handle the link.
+    # Browser fallback
     web_url = (
         "https://www.bybit.com/"
         f"en/trade/spot/{coin}/USDT"
@@ -6083,15 +6083,18 @@ def send_telegram(
 
     payload = {
 
-        "chat_id":
-            TELEGRAM_CHAT_ID,
+    "chat_id":
+        TELEGRAM_CHAT_ID,
 
-        "text":
-            message,
+    "text":
+        message,
 
-        "disable_web_page_preview":
-            True,
-    }
+    "parse_mode":
+        "HTML",
+
+    "disable_web_page_preview":
+        True,
+}
 
 
     if (
@@ -6168,18 +6171,18 @@ def send_signal(
 
     icon = (
 
-        "🚀"
+    "🟢"
 
-        if (
-            direction
-            ==
-            "PUMP"
-        )
-
-        else
-
-        "🔻"
+    if (
+        direction
+        ==
+        "PUMP"
     )
+
+    else
+
+    "🔴"
+)
 
 
     change = alert[
@@ -6202,27 +6205,18 @@ def send_signal(
     )
 
 
-    message = (
+message = (
 
-        f"{icon} "
-        f"{coin} "
-        f"{direction}\n\n"
+    f"{icon} "
+    f"{coin} → "
+    f"<b>{direction}</b>\n\n"
 
-        f"Move: "
-        f"{change_text}\n"
+    f"Move: "
+    f"{change_text}\n"
 
-        f"Window: "
-        f"{alert['window_label']}\n\n"
-
-        f"Reference: "
-        f"{format_price(alert['reference_price'])}\n"
-
-        f"Current: "
-        f"{format_price(alert['current_price'])}\n\n"
-
-        f"Detected: "
-        f"{current_uk_time()} UK"
-    )
+    f"Window: "
+    f"{alert['window_label']}"
+)
 
 
     send_telegram(
@@ -6250,7 +6244,7 @@ def send_staircase_signal(alert):
     coin = coin_name(symbol)
 
     message = (
-        f"🪜 {coin} STAIR + BREAKOUT\n\n"
+        f"🪜 {coin} → STAIR + BREAKOUT\n\n"
         f"Timeframe: {alert['timeframe']}\n"
         f"Pattern: 4 stair candles + 1 breakout candle\n\n"
         f"Stair rise: +{alert['stair_total_rise']:.2f}%\n"
@@ -6258,9 +6252,7 @@ def send_staircase_signal(alert):
         f"Higher closes: {alert['stair_higher_closes']}/3\n"
         f"Higher lows: {alert['stair_higher_lows']}/3\n\n"
         f"Breakout candle body: +{alert['breakout_body']:.2f}%\n"
-        f"Breakout strength: {alert['breakout_multiplier']:.2f}x stair average\n"
-        f"Current: {format_price(alert['current_price'])}\n\n"
-        f"Detected: {current_uk_time()} UK"
+        f"Breakout strength: {alert['breakout_multiplier']:.2f}x stair average"
     )
 
     send_telegram(
@@ -6308,7 +6300,7 @@ def send_early_pump_signal(
     message = (
 
         f"{title_icon} "
-        f"{coin} "
+        f"{coin} → "
         f"{title_text}\n\n"
 
         f"Score: "
@@ -6332,12 +6324,6 @@ def send_early_pump_signal(
 
         f"Order-book bids: "
         f"{fmt_optional_pressure(alert.get('bid_pressure'))}\n\n"
-
-        f"Current: "
-        f"{format_price(alert['current_price'])}\n\n"
-
-        f"Detected: "
-        f"{current_uk_time()} UK\n\n"
 
         f"Early unusual activity detected."
     )
@@ -6379,7 +6365,7 @@ def send_uturn_signal(
     message = (
 
         f"🔄 "
-        f"{coin} "
+        f"{coin} → "
         f"U-TURN\n\n"
 
         f"Score: "
@@ -6410,12 +6396,6 @@ def send_uturn_signal(
 
         f"Order-book bids: "
         f"{fmt_optional_pressure(alert.get('bid_pressure'))}\n\n"
-
-        f"Current: "
-        f"{format_price(alert['current_price'])}\n\n"
-
-        f"Detected: "
-        f"{current_uk_time()} UK\n\n"
 
         f"Possible crash reversal detected."
     )
