@@ -349,11 +349,14 @@ def coin_name(symbol):
 def bybit_spot_url(symbol):
     coin = coin_name(symbol)
 
-    # Open the market-detail/chart page for this coin
-    # instead of the Buy/Sell trading-entry screen.
+    # Use the older Bybit deep-link route that is confirmed
+    # to open the selected USDT Spot market in the Bybit app.
     deep_link = (
-        "bybitapp://open/market/detail?"
-        f"symbol={symbol}"
+        "bybitapp://open/home?"
+        "tab=3"
+        "&tabName=margin"
+        "&page=market"
+        f"&symbol={symbol}"
     )
 
     # Browser fallback
