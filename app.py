@@ -65,9 +65,13 @@ TELEGRAM_CHAT_ID = clean_secret(
 # ============================================================
 
 WINDOWS = {
-    5: 10.0,
-    10: 15.0,
-    15: 20.0,
+    1: 5.0,
+    3: 5.0,
+    5: 5.0,
+    10: 10.0,
+    15: 10.0,
+    20: 15.0,
+    30: 20.0,
 }
 
 DAILY_THRESHOLD = 30.0
@@ -91,19 +95,20 @@ REFERENCE_TOLERANCE_SECONDS = 90
 
 STAIRCASE_TIMEFRAME_MINUTES = 15
 
-# We will analyse 5 completed 15m candles:
-# first 4 = staircase
+# We will analyse 4 completed 15m candles:
+# first 3 = staircase
 # last 1 = breakout
-STAIRCASE_CANDLES = 5
+STAIRCASE_CANDLES = 4
 
-# First 4 candles should mostly be green
+# All 3 stair candles should be green
 STAIR_STEP_GREEN_MIN = 3
 
-# First 4 candles should show higher closes / higher lows
-STAIR_STEP_HIGHER_CLOSES_MIN = 3
-STAIR_STEP_HIGHER_LOWS_MIN = 3
+# Across 3 stair candles there are 2 close-to-close / low-to-low transitions.
+# Require both to rise.
+STAIR_STEP_HIGHER_CLOSES_MIN = 2
+STAIR_STEP_HIGHER_LOWS_MIN = 2
 
-# Total rise across the first 4 stair candles
+# Total rise across the first 3 stair candles
 STAIR_STEP_MIN_TOTAL_RISE = 1.0
 STAIR_STEP_MAX_TOTAL_RISE = 8.0
 
@@ -1312,8 +1317,8 @@ def build_completed_15m_candles(
 
 def staircase_metrics(candles):
     """
-    candles = 5 completed 15m candles
-    first 4 = staircase
+    candles = 4 completed 15m candles
+    first 3 = staircase
     last 1 = breakout
     """
 
@@ -1400,7 +1405,7 @@ def staircase_metrics(candles):
 
 
 def qualifies_as_staircase(metrics):
-    # 1) First 4 candles = staircase
+    # 1) First 3 candles = staircase
     staircase_ok = (
         metrics["stair_green"] >= STAIR_STEP_GREEN_MIN
         and metrics["stair_higher_closes"] >= STAIR_STEP_HIGHER_CLOSES_MIN
@@ -6221,11 +6226,11 @@ def send_staircase_signal(alert):
     message = (
         f"🪜 {coin} → STAIR + BREAKOUT\n\n"
         f"Timeframe: {alert['timeframe']}\n"
-        f"Pattern: 4 stair candles + 1 breakout candle\n\n"
+        f"Pattern: 3 stair candles + 1 breakout candle\n\n"
         f"Stair rise: +{alert['stair_total_rise']:.2f}%\n"
-        f"Green stair candles: {alert['stair_green']}/4\n"
-        f"Higher closes: {alert['stair_higher_closes']}/3\n"
-        f"Higher lows: {alert['stair_higher_lows']}/3\n\n"
+        f"Green stair candles: {alert['stair_green']}/3\n"
+        f"Higher closes: {alert['stair_higher_closes']}/2\n"
+        f"Higher lows: {alert['stair_higher_lows']}/2\n\n"
         f"Breakout candle body: +{alert['breakout_body']:.2f}%\n"
         f"Breakout strength: {alert['breakout_multiplier']:.2f}x stair average"
     )
@@ -6424,6 +6429,12 @@ def get_warmup_status(
             "15m":
                 False,
 
+            "20m":
+                False,
+
+            "30m":
+                False,
+
             "24h":
                 True,
 
@@ -6485,6 +6496,20 @@ def get_warmup_status(
                 15 * 60
             ),
 
+        "20m":
+            (
+                oldest_age
+                >=
+                20 * 60
+            ),
+
+        "30m":
+            (
+                oldest_age
+                >=
+                30 * 60
+            ),
+
         "24h":
             True,
 
@@ -6506,7 +6531,7 @@ def get_warmup_status(
             (
                 oldest_age
                 >=
-                90 * 60
+                75 * 60
             ),
     }
 
@@ -6689,13 +6714,15 @@ def run_detector():
                 f"USDT Spot markets: "
                 f"{len(current_prices)}\n\n"
 
-                "Large Pump / Crash:\n"
+                "Pump / Crash thresholds:\n"
 
-                "5 min: ±10%\n"
+                "1 / 3 / 5 min: ±5%\n"
 
-                "10 min: ±15%\n"
+                "10 / 15 min: ±10%\n"
 
-                "15 min: ±20%\n"
+                "20 min: ±15%\n"
+
+                "30 min: ±20%\n"
 
                 "24 hours: ±30%\n\n"
 
@@ -6714,7 +6741,7 @@ def run_detector():
                 "first few minutes.\n"
 
                 "Staircase needs roughly "
-                "75–90 minutes after "
+                "60–75 minutes after "
                 "a restart."
             )
 
@@ -7069,13 +7096,25 @@ def home():
 
         "thresholds": {
 
+            "1_min":
+                "±5%",
+
+            "3_min":
+                "±5%",
+
             "5_min":
-                "±10%",
+                "±5%",
 
             "10_min":
-                "±15%",
+                "±10%",
 
             "15_min":
+                "±10%",
+
+            "20_min":
+                "±15%",
+
+            "30_min":
                 "±20%",
 
             "24_hours":
