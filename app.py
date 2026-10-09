@@ -65,16 +65,12 @@ TELEGRAM_CHAT_ID = clean_secret(
 # ============================================================
 
 WINDOWS = {
-    1: 5.0,
-    3: 5.0,
     5: 5.0,
     10: 10.0,
-    15: 10.0,
-    20: 15.0,
-    30: 20.0,
+    15: 15.0,
 }
 
-DAILY_THRESHOLD = 30.0
+DAILY_THRESHOLD = 24.0
 
 REARM_BUFFER = 2.0
 
@@ -129,6 +125,36 @@ STAIRCASE_MIN_SAMPLES_PER_CANDLE = 8
 
 # Avoid repeated alerts
 STAIRCASE_COOLDOWN_SECONDS = 2 * 60 * 60
+
+# ------------------------------------------------------------
+# FLEXIBLE STAIRCASE SHAPE
+# ------------------------------------------------------------
+# Detect the same visual shape at several speeds instead of
+# tying it to one fixed candle timeframe.  The detector samples
+# the stored one-minute price history over these windows.
+STAIR_SHAPE_WINDOWS_MINUTES = (15, 30, 60, 120)
+STAIR_SHAPE_POINTS = 9
+
+# Minimum total rise required for each speed/window.
+STAIR_SHAPE_MIN_RISE_BY_WINDOW = {
+    15: 2.0,
+    30: 3.0,
+    60: 4.0,
+    120: 5.0,
+}
+
+# Shape rules: mostly rising steps, small pullbacks, no single
+# candle/step responsible for the whole move, and stronger
+# momentum toward the right side of the pattern.
+STAIR_SHAPE_MAX_TOTAL_RISE = 60.0
+STAIR_SHAPE_MIN_UP_STEPS = 6
+STAIR_SHAPE_MAX_DOWN_STEPS = 2
+STAIR_SHAPE_MAX_PULLBACK = 4.0
+STAIR_SHAPE_MAX_SINGLE_UP_STEP = 12.0
+STAIR_SHAPE_MAX_STEP_SHARE = 0.60
+STAIR_SHAPE_NEAR_HIGH_TOLERANCE = 0.8
+STAIR_SHAPE_MIN_ACCELERATION_RATIO = 1.10
+STAIR_SHAPE_SAMPLE_TOLERANCE_SECONDS = 150
 
 # ============================================================
 # EARLY PUMP
@@ -1431,70 +1457,241 @@ def qualifies_as_staircase(metrics):
     return staircase_ok and breakout_ok
 
 
-def detect_staircases(
-    now
+def _shape_sample_snapshots(
+    now,
+    window_minutes,
+    points=STAIR_SHAPE_POINTS
 ):
+    """
+    Pick evenly spaced snapshots across a time window.
+    This makes the visual staircase detector independent of a
+    single fixed chart timeframe.
+    """
 
-    global staircase_active
+    if not history or points < 3:
+        return None
 
-    candle_sets = (
-        build_completed_15m_candles(
-            now
+    start_time = now - (window_minutes * 60)
+    spacing = (window_minutes * 60) / (points - 1)
+    selected = []
+
+    for index in range(points):
+        target = start_time + (index * spacing)
+        best = None
+
+        # History is chronological.  Search backwards so the
+        # closest snapshot at-or-before the target is found fast.
+        for snapshot in reversed(history):
+            timestamp = snapshot["timestamp"]
+
+            if timestamp <= target:
+                if (
+                    target - timestamp
+                    <= STAIR_SHAPE_SAMPLE_TOLERANCE_SECONDS
+                ):
+                    best = snapshot
+                break
+
+        if best is None:
+            return None
+
+        selected.append(best)
+
+    return selected
+
+
+def _stair_shape_metrics(prices):
+    steps = [
+        percent_change(prices[index], prices[index - 1])
+        for index in range(1, len(prices))
+    ]
+
+    if any(step is None for step in steps):
+        return None
+
+    total_rise = percent_change(prices[-1], prices[0])
+
+    if total_rise is None:
+        return None
+
+    # Ignore tiny ±0.05% noise when counting direction changes.
+    up_steps = sum(1 for step in steps if step > 0.05)
+    down_steps = sum(1 for step in steps if step < -0.05)
+
+    largest_up_step = max(steps) if steps else 0.0
+    worst_pullback = min(steps) if steps else 0.0
+
+    max_price = max(prices)
+    distance_from_high = (
+        ((max_price - prices[-1]) / max_price) * 100
+        if max_price > 0
+        else 999.0
+    )
+
+    # Compare three broad sections of the pattern.  The photo the
+    # user supplied rises in stages, pauses/pulls back, then rises
+    # faster again toward the right-hand side.
+    first_band = statistics.mean(prices[0:3])
+    middle_band = statistics.mean(prices[3:6])
+    last_band = statistics.mean(prices[6:9])
+
+    early_gain = percent_change(prices[3], prices[0]) or 0.0
+    late_gain = percent_change(prices[-1], prices[-4]) or 0.0
+
+    if early_gain > 0.10:
+        acceleration_ratio = late_gain / early_gain
+    elif late_gain > 0:
+        acceleration_ratio = 999.0
+    else:
+        acceleration_ratio = 0.0
+
+    positive_steps = [step for step in steps if step > 0]
+    largest_step_share = (
+        largest_up_step / total_rise
+        if total_rise > 0 and largest_up_step > 0
+        else 0.0
+    )
+
+    return {
+        "rise_pct": total_rise,
+        "up_steps": up_steps,
+        "down_steps": down_steps,
+        "total_steps": len(steps),
+        "largest_up_step": largest_up_step,
+        "worst_pullback": worst_pullback,
+        "distance_from_high": distance_from_high,
+        "first_band": first_band,
+        "middle_band": middle_band,
+        "last_band": last_band,
+        "early_gain": early_gain,
+        "late_gain": late_gain,
+        "acceleration_ratio": acceleration_ratio,
+        "largest_step_share": largest_step_share,
+        "average_positive_step": (
+            statistics.mean(positive_steps)
+            if positive_steps
+            else 0.0
+        ),
+        "current_price": prices[-1],
+    }
+
+
+def _qualifies_as_flexible_stair_shape(
+    metrics,
+    window_minutes
+):
+    if metrics is None:
+        return False
+
+    minimum_rise = STAIR_SHAPE_MIN_RISE_BY_WINDOW.get(
+        window_minutes,
+        3.0
+    )
+
+    return (
+        minimum_rise
+        <= metrics["rise_pct"]
+        <= STAIR_SHAPE_MAX_TOTAL_RISE
+        and metrics["up_steps"] >= STAIR_SHAPE_MIN_UP_STEPS
+        and metrics["down_steps"] <= STAIR_SHAPE_MAX_DOWN_STEPS
+        and metrics["worst_pullback"] >= -STAIR_SHAPE_MAX_PULLBACK
+        and metrics["largest_up_step"] <= STAIR_SHAPE_MAX_SINGLE_UP_STEP
+        and metrics["largest_step_share"] <= STAIR_SHAPE_MAX_STEP_SHARE
+        and metrics["distance_from_high"] <= STAIR_SHAPE_NEAR_HIGH_TOLERANCE
+        and metrics["first_band"] < metrics["middle_band"] < metrics["last_band"]
+        and metrics["late_gain"] > 0
+        and (
+            metrics["early_gain"] <= 0.10
+            or metrics["acceleration_ratio"]
+            >= STAIR_SHAPE_MIN_ACCELERATION_RATIO
         )
     )
 
-    alerts = []
 
-    matched_symbols = set()
+def _detect_flexible_stair_shapes(now):
+    """
+    Detect the attached gradual-rising staircase shape at several
+    speeds: ~15m, 30m, 60m and 120m.  The shortest qualifying
+    window is preferred so the alert arrives as early as possible.
+    """
 
-    for (
-        symbol,
-        candles
-    ) in candle_sets.items():
+    best_by_symbol = {}
 
-        metrics = (
-            staircase_metrics(
-                candles
-            )
+    for window_minutes in STAIR_SHAPE_WINDOWS_MINUTES:
+        snapshots = _shape_sample_snapshots(
+            now,
+            window_minutes
         )
 
-        if not qualifies_as_staircase(
-            metrics
-        ):
-
+        if snapshots is None:
             continue
 
-        matched_symbols.add(
-            symbol
-        )
+        symbols = set(snapshots[-1]["prices"].keys())
 
-        if (
-            symbol
-            in staircase_active
-        ):
+        for symbol in symbols:
+            prices = []
+            valid = True
 
+            for snapshot in snapshots:
+                price = snapshot["prices"].get(symbol)
+
+                if not price or price <= 0:
+                    valid = False
+                    break
+
+                prices.append(price)
+
+            if not valid:
+                continue
+
+            metrics = _stair_shape_metrics(prices)
+
+            if not _qualifies_as_flexible_stair_shape(
+                metrics,
+                window_minutes
+            ):
+                continue
+
+            alert = {
+                "symbol": symbol,
+                "direction": "STAIRCASE",
+                "pattern_type": "RISING_STAIRCASE",
+                "timeframe": "timeframe-independent",
+                "window_minutes": window_minutes,
+                "rise_pct": metrics["rise_pct"],
+                "up_steps": metrics["up_steps"],
+                "down_steps": metrics["down_steps"],
+                "total_steps": metrics["total_steps"],
+                "worst_pullback": metrics["worst_pullback"],
+                "largest_up_step": metrics["largest_up_step"],
+                "acceleration_ratio": metrics["acceleration_ratio"],
+                "current_price": metrics["current_price"],
+            }
+
+            # Windows are scanned shortest -> longest, so keep the
+            # first match for earliest practical detection.
+            best_by_symbol.setdefault(symbol, alert)
+
+    return best_by_symbol
+
+
+def _detect_legacy_stair_breakouts(now):
+    """Keep the existing 15m stair + breakout pattern as an
+    additional accepted staircase shape."""
+
+    matches = {}
+    candle_sets = build_completed_15m_candles(now)
+
+    for symbol, candles in candle_sets.items():
+        metrics = staircase_metrics(candles)
+
+        if not qualifies_as_staircase(metrics):
             continue
 
-        previous_alert_time = (
-            staircase_last_alert.get(
-                symbol,
-                0
-            )
-        )
-
-        if (
-            now
-            - previous_alert_time
-            <
-            STAIRCASE_COOLDOWN_SECONDS
-        ):
-
-            continue
-
-        alerts.append({
-
+        matches[symbol] = {
             "symbol": symbol,
             "direction": "STAIRCASE",
+            "pattern_type": "STAIR_BREAKOUT",
             "timeframe": "15m",
             "candles": STAIRCASE_CANDLES,
             "stair_green": metrics["stair_green"],
@@ -1504,19 +1701,51 @@ def detect_staircases(
             "breakout_body": metrics["breakout_body"],
             "breakout_multiplier": metrics["breakout_multiplier"],
             "current_price": metrics["current_price"],
-        })
+        }
 
-        staircase_last_alert[
-            symbol
-        ] = now
+    return matches
 
-        staircase_active.add(
-            symbol
-        )
 
-    staircase_active.intersection_update(
-        matched_symbols
-    )
+def detect_staircases(now):
+    """
+    Combined staircase detector:
+      1) flexible visual staircase shape across several speeds;
+      2) the original 15m stair + breakout rule.
+
+    Only one staircase alert per symbol is sent during an active
+    move, and the existing two-hour cooldown is preserved.
+    """
+
+    global staircase_active
+
+    flexible_matches = _detect_flexible_stair_shapes(now)
+    legacy_matches = _detect_legacy_stair_breakouts(now)
+
+    matched_symbols = set(flexible_matches) | set(legacy_matches)
+    alerts = []
+
+    for symbol in matched_symbols:
+        # Prefer the new flexible shape when both match.  It is the
+        # pattern requested from the supplied screenshot and is
+        # normally detected earlier than a breakout confirmation.
+        alert = flexible_matches.get(symbol) or legacy_matches[symbol]
+
+        if symbol in staircase_active:
+            continue
+
+        previous_alert_time = staircase_last_alert.get(symbol, 0)
+
+        if (
+            now - previous_alert_time
+            < STAIRCASE_COOLDOWN_SECONDS
+        ):
+            continue
+
+        alerts.append(alert)
+        staircase_last_alert[symbol] = now
+        staircase_active.add(symbol)
+
+    staircase_active.intersection_update(matched_symbols)
 
     return alerts
 
@@ -2363,7 +2592,7 @@ def detect_early_pumps(
             continue
 
 
-        # If the normal +10% / 5m
+        # If the normal +5% / 5m
         # PUMP threshold has already
         # been reached, don't send
         # another EARLY alert.
@@ -6223,17 +6452,42 @@ def send_staircase_signal(alert):
     symbol = alert["symbol"]
     coin = coin_name(symbol)
 
-    message = (
-        f"🪜 {coin} → STAIR + BREAKOUT\n\n"
-        f"Timeframe: {alert['timeframe']}\n"
-        f"Pattern: 3 stair candles + 1 breakout candle\n\n"
-        f"Stair rise: +{alert['stair_total_rise']:.2f}%\n"
-        f"Green stair candles: {alert['stair_green']}/3\n"
-        f"Higher closes: {alert['stair_higher_closes']}/2\n"
-        f"Higher lows: {alert['stair_higher_lows']}/2\n\n"
-        f"Breakout candle body: +{alert['breakout_body']:.2f}%\n"
-        f"Breakout strength: {alert['breakout_multiplier']:.2f}x stair average"
-    )
+    if alert.get("pattern_type") == "RISING_STAIRCASE":
+        acceleration = alert.get("acceleration_ratio", 0.0)
+
+        if acceleration >= 100:
+            acceleration_text = "strong"
+        else:
+            acceleration_text = f"{acceleration:.2f}x"
+
+        message = (
+            f"🪜 {coin} STAIRCASE\n\n"
+            "Gradual rising staircase shape detected.\n"
+            "This pattern is not tied to one fixed candle timeframe.\n\n"
+            f"Shape window: ~{alert['window_minutes']} minutes\n"
+            f"Rise: +{alert['rise_pct']:.2f}%\n"
+            f"Up steps: {alert['up_steps']}/{alert['total_steps']}\n"
+            f"Pullback steps: {alert['down_steps']}/{alert['total_steps']}\n"
+            f"Largest pullback: {alert['worst_pullback']:+.2f}%\n"
+            f"Late acceleration: {acceleration_text}\n\n"
+            f"Current: {format_price(alert['current_price'])}\n"
+            f"Detected: {current_uk_time()} UK"
+        )
+
+    else:
+        message = (
+            f"🪜 {coin} → STAIR + BREAKOUT\n\n"
+            f"Timeframe: {alert['timeframe']}\n"
+            f"Pattern: 3 stair candles + 1 breakout candle\n\n"
+            f"Stair rise: +{alert['stair_total_rise']:.2f}%\n"
+            f"Green stair candles: {alert['stair_green']}/3\n"
+            f"Higher closes: {alert['stair_higher_closes']}/2\n"
+            f"Higher lows: {alert['stair_higher_lows']}/2\n\n"
+            f"Breakout candle body: +{alert['breakout_body']:.2f}%\n"
+            f"Breakout strength: {alert['breakout_multiplier']:.2f}x stair average\n\n"
+            f"Current: {format_price(alert['current_price'])}\n"
+            f"Detected: {current_uk_time()} UK"
+        )
 
     send_telegram(
         message,
@@ -6444,6 +6698,9 @@ def get_warmup_status(
             "uturn":
                 False,
 
+            "staircase_shape":
+                False,
+
             "staircase_15m":
                 False,
         }
@@ -6525,6 +6782,13 @@ def get_warmup_status(
                 oldest_age
                 >=
                 3 * 60
+            ),
+
+        "staircase_shape":
+            (
+                oldest_age
+                >=
+                min(STAIR_SHAPE_WINDOWS_MINUTES) * 60
             ),
 
         "staircase_15m":
@@ -6716,15 +6980,13 @@ def run_detector():
 
                 "Pump / Crash thresholds:\n"
 
-                "1 / 3 / 5 min: ±5%\n"
+                "5 min: ±5%\n"
 
-                "10 / 15 min: ±10%\n"
+                "10 min: ±10%\n"
 
-                "20 min: ±15%\n"
+                "15 min: ±15%\n"
 
-                "30 min: ±20%\n"
-
-                "24 hours: ±30%\n\n"
+                "24 hours: ±24%\n\n"
 
                 "⚡ Early Pump: enabled\n"
 
@@ -6740,9 +7002,12 @@ def run_detector():
                 "warms up during the "
                 "first few minutes.\n"
 
-                "Staircase needs roughly "
-                "60–75 minutes after "
-                "a restart."
+                "Flexible staircase shape starts "
+                "after roughly 15 minutes; "
+                "30/60/120-minute scales warm up "
+                "as more history is collected. "
+                "The original 15m stair + breakout "
+                "rule also remains enabled."
             )
 
 
@@ -6964,9 +7229,23 @@ def run_detector():
                     {
 
                         "rise":
-                            alert[
-                                "stair_total_rise"
-                            ],
+                            alert.get(
+                                "rise_pct",
+                                alert.get(
+                                    "stair_total_rise"
+                                )
+                            ),
+
+                        "pattern":
+                            alert.get(
+                                "pattern_type",
+                                "STAIRCASE"
+                            ),
+
+                        "window_minutes":
+                            alert.get(
+                                "window_minutes"
+                            ),
                     }
                 )
 
@@ -7096,12 +7375,6 @@ def home():
 
         "thresholds": {
 
-            "1_min":
-                "±5%",
-
-            "3_min":
-                "±5%",
-
             "5_min":
                 "±5%",
 
@@ -7109,16 +7382,10 @@ def home():
                 "±10%",
 
             "15_min":
-                "±10%",
-
-            "20_min":
                 "±15%",
 
-            "30_min":
-                "±20%",
-
             "24_hours":
-                "±30%",
+                "±24%",
         },
 
 
@@ -7184,23 +7451,34 @@ def home():
 
         "staircase": {
 
-            "timeframe":
+            "status":
+                "enabled",
+
+            "mode":
+                "flexible visual shape + original 15m breakout",
+
+            "shape_windows_minutes":
+                list(
+                    STAIR_SHAPE_WINDOWS_MINUTES
+                ),
+
+            "shape_points":
+                STAIR_SHAPE_POINTS,
+
+            "shape_min_up_steps":
+                STAIR_SHAPE_MIN_UP_STEPS,
+
+            "shape_max_down_steps":
+                STAIR_SHAPE_MAX_DOWN_STEPS,
+
+            "shape_max_pullback_pct":
+                STAIR_SHAPE_MAX_PULLBACK,
+
+            "legacy_timeframe":
                 "15m",
 
-            "candles":
+            "legacy_candles":
                 STAIRCASE_CANDLES,
-
-            "minimum_green":
-                STAIR_STEP_GREEN_MIN,
-
-            "minimum_higher_closes":
-                STAIR_STEP_HIGHER_CLOSES_MIN,
-
-            "minimum_higher_lows":
-                STAIR_STEP_HIGHER_LOWS_MIN,
-
-            "rise_range":
-                f"{STAIR_STEP_MIN_TOTAL_RISE}% to {STAIR_STEP_MAX_TOTAL_RISE}%",
         },
 
 
