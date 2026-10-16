@@ -64,13 +64,15 @@ TELEGRAM_CHAT_ID = clean_secret(
 # EXISTING PUMP / CRASH RULES
 # ============================================================
 
+# High-signal mode:
+# Keep the user's requested hard-move alert at ±5% over 5 minutes.
+# Slower 10m / 15m / 24h hard-move Telegram alerts are disabled
+# to reduce duplicate/noisy notifications.
 WINDOWS = {
     5: 5.0,
-    10: 10.0,
-    15: 15.0,
 }
 
-DAILY_THRESHOLD = 24.0
+DAILY_THRESHOLD = 24.0  # retained for compatibility; Telegram 24h alerts disabled
 
 REARM_BUFFER = 2.0
 
@@ -132,28 +134,28 @@ STAIRCASE_COOLDOWN_SECONDS = 2 * 60 * 60
 # Detect the same visual shape at several speeds instead of
 # tying it to one fixed candle timeframe.  The detector samples
 # the stored one-minute price history over these windows.
-STAIR_SHAPE_WINDOWS_MINUTES = (15, 30, 60, 120)
+# High-confidence staircase only: drop the noisy 15-minute scale.
+STAIR_SHAPE_WINDOWS_MINUTES = (30, 60, 120)
 STAIR_SHAPE_POINTS = 9
 
 # Minimum total rise required for each speed/window.
 STAIR_SHAPE_MIN_RISE_BY_WINDOW = {
-    15: 2.0,
-    30: 3.0,
-    60: 4.0,
-    120: 5.0,
+    30: 4.0,
+    60: 6.0,
+    120: 8.0,
 }
 
 # Shape rules: mostly rising steps, small pullbacks, no single
 # candle/step responsible for the whole move, and stronger
 # momentum toward the right side of the pattern.
-STAIR_SHAPE_MAX_TOTAL_RISE = 60.0
-STAIR_SHAPE_MIN_UP_STEPS = 6
-STAIR_SHAPE_MAX_DOWN_STEPS = 2
-STAIR_SHAPE_MAX_PULLBACK = 4.0
-STAIR_SHAPE_MAX_SINGLE_UP_STEP = 12.0
-STAIR_SHAPE_MAX_STEP_SHARE = 0.60
-STAIR_SHAPE_NEAR_HIGH_TOLERANCE = 0.8
-STAIR_SHAPE_MIN_ACCELERATION_RATIO = 1.10
+STAIR_SHAPE_MAX_TOTAL_RISE = 30.0
+STAIR_SHAPE_MIN_UP_STEPS = 7
+STAIR_SHAPE_MAX_DOWN_STEPS = 1
+STAIR_SHAPE_MAX_PULLBACK = 2.0
+STAIR_SHAPE_MAX_SINGLE_UP_STEP = 6.0
+STAIR_SHAPE_MAX_STEP_SHARE = 0.40
+STAIR_SHAPE_NEAR_HIGH_TOLERANCE = 0.5
+STAIR_SHAPE_MIN_ACCELERATION_RATIO = 1.25
 STAIR_SHAPE_SAMPLE_TOLERANCE_SECONDS = 150
 
 # ============================================================
@@ -166,16 +168,17 @@ STAIR_SHAPE_SAMPLE_TOLERANCE_SECONDS = 150
 # volume / trades / order-book check
 # if it first starts moving unusually.
 
-EARLY_PREFILTER_1M = 1.5
+EARLY_PREFILTER_1M = 1.8
 
-EARLY_PREFILTER_3M = 3.0
+EARLY_PREFILTER_3M = 3.2
 
-EARLY_PREFILTER_5M = 4.5
+EARLY_PREFILTER_5M = 4.2
 
 
 # Score needed for Telegram alert.
 
-EARLY_ALERT_SCORE = 70
+# Only send the strongest Early Pump setups.
+EARLY_ALERT_SCORE = 85
 
 EARLY_STRONG_SCORE = 85
 
@@ -183,20 +186,20 @@ EARLY_STRONG_SCORE = 85
 # If the score falls below this,
 # the coin becomes eligible again later.
 
-EARLY_REARM_SCORE = 55
+EARLY_REARM_SCORE = 65
 
 
 # Prevent repeated alerts for same coin.
 
 EARLY_COOLDOWN_SECONDS = (
-    30 * 60
+    60 * 60
 )
 
 
 # Maximum number of suspicious coins
 # we deeply analyse in one cron run.
 
-MAX_DEEP_SCANS_PER_RUN = 15
+MAX_DEEP_SCANS_PER_RUN = 10
 
 
 # ============================================================
@@ -206,27 +209,69 @@ MAX_DEEP_SCANS_PER_RUN = 15
 # Watch a crashed coin for up to 3 hours.
 
 UTURN_WATCH_SECONDS = (
-    3 * 60 * 60
+    2 * 60 * 60
 )
 
 
 # Must recover at least 5% from
 # its post-crash low.
 
-UTURN_MIN_RECOVERY = 5.0
+UTURN_MIN_RECOVERY = 7.0
 
 
 # Short-term upward movement needed.
 
-UTURN_MIN_1M_CHANGE = 1.0
+UTURN_MIN_1M_CHANGE = 1.5
 
-UTURN_MIN_3M_CHANGE = 2.0
+UTURN_MIN_3M_CHANGE = 3.0
 
 
 # Minimum U-turn confidence score.
 
-UTURN_ALERT_SCORE = 65
+UTURN_ALERT_SCORE = 80
 
+
+# ============================================================
+# HIGH-CONFIDENCE BOTTOM REVERSAL (4H)
+# ============================================================
+# This targets the shape in the supplied RATS screenshot:
+# a major capitulation-style fall, then stabilization near the low,
+# followed by the first credible recovery signs.
+#
+# It deliberately uses completed 4-hour Bybit candles because
+# lower timeframes create far more false positives.
+
+BOTTOM_INTERVAL = "240"               # 4 hours
+BOTTOM_LOOKBACK_CANDLES = 42          # ~7 days
+BOTTOM_SCAN_PER_RUN = 10              # rotate through the market
+BOTTOM_MIN_TURNOVER_24H = 200_000.0   # avoid the thinnest markets
+
+BOTTOM_MIN_CRASH_PCT = 30.0
+BOTTOM_MIN_CANDLES_AFTER_LOW = 2
+BOTTOM_MAX_CANDLES_AFTER_LOW = 8
+
+# We want the alert while the price is still fairly close to the bottom,
+# not after most of the rebound has already happened.
+BOTTOM_MIN_RECOVERY_PCT = 3.0
+BOTTOM_MAX_RECOVERY_PCT = 18.0
+
+BOTTOM_MAX_POST_LOW_RANGE_PCT = 25.0
+BOTTOM_MIN_HIGHER_CLOSES = 2
+BOTTOM_MIN_HIGHER_LOWS = 2
+BOTTOM_ALERT_SCORE = 80
+BOTTOM_COOLDOWN_SECONDS = 24 * 60 * 60
+
+# Do not send several bullish Telegram alerts for the same coin
+# from different detectors within a short period.
+BULLISH_GLOBAL_COOLDOWN_SECONDS = 45 * 60
+
+
+# Confirm ±5% / 5m hard moves with real activity before Telegram.
+HARD_MOVE_MIN_TURNOVER_24H = 200_000.0
+HARD_MOVE_MIN_VOLUME_RATIO = 2.0
+HARD_MOVE_PUMP_MIN_BUY_PRESSURE = 60.0
+HARD_MOVE_CRASH_MAX_BUY_PRESSURE = 40.0
+MAX_HARD_MOVE_ALERTS_PER_RUN = 3
 
 
 # ============================================================
@@ -328,6 +373,14 @@ early_last_alert = {}
 uturn_watch = {}
 
 
+# Bottom-reversal scanner state.
+bottom_scan_cursor = 0
+bottom_last_alert = {}
+
+# Cross-detector bullish anti-spam.
+bullish_last_alert = {}
+
+
 # ============================================================
 # SIGNAL JOURNAL
 #
@@ -362,6 +415,22 @@ shadow_last_anchor_ms = None
 shadow_last_recorded = {}
 shadow_last_scan_count = 0
 shadow_last_top_score = None
+
+
+# ============================================================
+# CROSS-DETECTOR BULLISH ANTI-SPAM
+# ============================================================
+
+def bullish_alert_allowed(symbol, now):
+    previous = bullish_last_alert.get(symbol, 0)
+    return (
+        now - previous
+        >= BULLISH_GLOBAL_COOLDOWN_SECONDS
+    )
+
+
+def mark_bullish_alert(symbol, now):
+    bullish_last_alert[symbol] = now
 
 
 # ============================================================
@@ -997,6 +1066,149 @@ def detect_signals(
                 )
 
     return alerts
+
+
+# ============================================================
+# CONFIRM 5-MINUTE HARD MOVES
+# ============================================================
+
+def confirm_hard_move_alerts(
+    alerts,
+    daily_data,
+    deep_cache
+):
+    """
+    A ±5% / 5m move is necessary but not sufficient for Telegram.
+    Confirm it with turnover, unusual 1m volume and directional
+    recent-trade pressure.  This removes many thin/noisy spikes.
+    """
+
+    confirmed = []
+
+    for alert in alerts:
+        symbol = alert[
+            "symbol"
+        ]
+
+        turnover_24h = (
+            daily_data.get(
+                symbol,
+                {}
+            ).get(
+                "turnover_24h",
+                0
+            )
+        )
+
+        if (
+            turnover_24h
+            <
+            HARD_MOVE_MIN_TURNOVER_24H
+        ):
+            continue
+
+        try:
+            if (
+                symbol
+                not in deep_cache
+            ):
+                deep_cache[
+                    symbol
+                ] = (
+                    deep_market_analysis(
+                        symbol
+                    )
+                )
+
+            analysis = (
+                deep_cache[
+                    symbol
+                ]
+            )
+
+        except Exception as exc:
+            print(
+                "Hard-move confirmation "
+                f"failed for {symbol}:",
+                exc
+            )
+            continue
+
+        volume_ratio = (
+            analysis.get(
+                "volume_ratio"
+            )
+        )
+
+        buy_pressure = (
+            analysis.get(
+                "buy_pressure"
+            )
+        )
+
+        if (
+            volume_ratio is None
+            or
+            volume_ratio
+            <
+            HARD_MOVE_MIN_VOLUME_RATIO
+            or
+            buy_pressure is None
+        ):
+            continue
+
+        direction = alert[
+            "direction"
+        ]
+
+        if (
+            direction == "PUMP"
+            and
+            buy_pressure
+            <
+            HARD_MOVE_PUMP_MIN_BUY_PRESSURE
+        ):
+            continue
+
+        if (
+            direction == "CRASH"
+            and
+            buy_pressure
+            >
+            HARD_MOVE_CRASH_MAX_BUY_PRESSURE
+        ):
+            continue
+
+        confirmed.append({
+            **alert,
+
+            "volume_ratio":
+                volume_ratio,
+
+            "buy_pressure":
+                buy_pressure,
+
+            "bid_pressure":
+                analysis.get(
+                    "bid_pressure"
+                ),
+        })
+
+    confirmed.sort(
+        key=lambda item:
+            abs(
+                item[
+                    "change"
+                ]
+            ),
+        reverse=True
+    )
+
+    return (
+        confirmed[
+            :MAX_HARD_MOVE_ALERTS_PER_RUN
+        ]
+    )
 
 
 # ============================================================
@@ -1708,44 +1920,67 @@ def _detect_legacy_stair_breakouts(now):
 
 def detect_staircases(now):
     """
-    Combined staircase detector:
-      1) flexible visual staircase shape across several speeds;
-      2) the original 15m stair + breakout rule.
+    High-confidence staircase detector.
 
-    Only one staircase alert per symbol is sent during an active
-    move, and the existing two-hour cooldown is preserved.
+    Only the flexible gradual-rising shape is used.  The older
+    "stair + breakout" detector is intentionally not used because
+    it often duplicates a Pump alert after the move is already
+    underway.
     """
 
     global staircase_active
 
-    flexible_matches = _detect_flexible_stair_shapes(now)
-    legacy_matches = _detect_legacy_stair_breakouts(now)
+    flexible_matches = (
+        _detect_flexible_stair_shapes(
+            now
+        )
+    )
 
-    matched_symbols = set(flexible_matches) | set(legacy_matches)
+    matched_symbols = set(
+        flexible_matches
+    )
+
     alerts = []
 
-    for symbol in matched_symbols:
-        # Prefer the new flexible shape when both match.  It is the
-        # pattern requested from the supplied screenshot and is
-        # normally detected earlier than a breakout confirmation.
-        alert = flexible_matches.get(symbol) or legacy_matches[symbol]
-
-        if symbol in staircase_active:
-            continue
-
-        previous_alert_time = staircase_last_alert.get(symbol, 0)
-
+    for symbol, alert in (
+        flexible_matches.items()
+    ):
         if (
-            now - previous_alert_time
-            < STAIRCASE_COOLDOWN_SECONDS
+            symbol
+            in staircase_active
         ):
             continue
 
-        alerts.append(alert)
-        staircase_last_alert[symbol] = now
-        staircase_active.add(symbol)
+        previous_alert_time = (
+            staircase_last_alert.get(
+                symbol,
+                0
+            )
+        )
 
-    staircase_active.intersection_update(matched_symbols)
+        if (
+            now
+            - previous_alert_time
+            <
+            STAIRCASE_COOLDOWN_SECONDS
+        ):
+            continue
+
+        alerts.append(
+            alert
+        )
+
+        staircase_last_alert[
+            symbol
+        ] = now
+
+        staircase_active.add(
+            symbol
+        )
+
+    staircase_active.intersection_update(
+        matched_symbols
+    )
 
     return alerts
 
@@ -3348,6 +3583,691 @@ def detect_uturns(
 
     return alerts
 
+
+
+# ============================================================
+# HIGH-CONFIDENCE BOTTOM REVERSAL — 4H
+# ============================================================
+
+def fetch_completed_4h_candles(
+    symbol,
+    now
+):
+    interval_ms = (
+        4 * 60 * 60 * 1000
+    )
+
+    # Ask Bybit only for completed 4h candles.
+    current_bucket_ms = (
+        int(now * 1000)
+        // interval_ms
+        * interval_ms
+    )
+
+    data, _ = bybit_get(
+        "/v5/market/kline",
+        {
+            "category":
+                "spot",
+
+            "symbol":
+                symbol,
+
+            "interval":
+                BOTTOM_INTERVAL,
+
+            "end":
+                current_bucket_ms - 1,
+
+            "limit":
+                BOTTOM_LOOKBACK_CANDLES,
+        }
+    )
+
+    candles = []
+
+    for row in (
+        data.get(
+            "result",
+            {}
+        ).get(
+            "list",
+            []
+        )
+    ):
+        try:
+            candles.append({
+                "start":
+                    int(row[0]),
+
+                "open":
+                    float(row[1]),
+
+                "high":
+                    float(row[2]),
+
+                "low":
+                    float(row[3]),
+
+                "close":
+                    float(row[4]),
+
+                "volume":
+                    float(row[5]),
+
+                "turnover":
+                    float(row[6]),
+            })
+
+        except (
+            TypeError,
+            ValueError,
+            IndexError
+        ):
+            continue
+
+    # Bybit returns newest first.
+    candles.reverse()
+
+    return candles
+
+
+def bottom_reversal_metrics(
+    candles
+):
+    if len(candles) < 12:
+        return None
+
+    # Find the largest peak-to-trough fall where the trough
+    # happened after the peak.
+    best_high = None
+    best_high_index = None
+    best_drop = 0.0
+    best_low_index = None
+    best_peak_price = None
+
+    for index, candle in enumerate(candles):
+        high = candle["high"]
+
+        if (
+            best_high is None
+            or high > best_high
+        ):
+            best_high = high
+            best_high_index = index
+
+        if (
+            best_high is None
+            or best_high <= 0
+            or best_high_index is None
+            or index <= best_high_index
+        ):
+            continue
+
+        drop = (
+            (
+                best_high
+                - candle["low"]
+            )
+            / best_high
+        ) * 100
+
+        if drop > best_drop:
+            best_drop = drop
+            best_low_index = index
+            best_peak_price = best_high
+
+    if (
+        best_low_index is None
+        or best_high_index is None
+    ):
+        return None
+
+    candles_after_low = (
+        len(candles)
+        - 1
+        - best_low_index
+    )
+
+    low_price = (
+        candles[
+            best_low_index
+        ][
+            "low"
+        ]
+    )
+
+    current_close = (
+        candles[
+            -1
+        ][
+            "close"
+        ]
+    )
+
+    recovery_pct = (
+        percent_change(
+            current_close,
+            low_price
+        )
+    )
+
+    if recovery_pct is None:
+        return None
+
+    post_low = (
+        candles[
+            best_low_index:
+        ]
+    )
+
+    post_low_high = max(
+        candle["high"]
+        for candle
+        in post_low
+    )
+
+    post_low_range_pct = (
+        (
+            post_low_high
+            - low_price
+        )
+        / low_price
+        * 100
+        if low_price > 0
+        else 999.0
+    )
+
+    recent = (
+        post_low[
+            -min(
+                5,
+                len(post_low)
+            ):
+        ]
+    )
+
+    higher_closes = sum(
+        1
+        for index
+        in range(
+            1,
+            len(recent)
+        )
+        if (
+            recent[index]["close"]
+            >
+            recent[index - 1]["close"]
+        )
+    )
+
+    higher_lows = sum(
+        1
+        for index
+        in range(
+            1,
+            len(recent)
+        )
+        if (
+            recent[index]["low"]
+            >
+            recent[index - 1]["low"]
+        )
+    )
+
+    latest_green = (
+        candles[-1]["close"]
+        >
+        candles[-1]["open"]
+    )
+
+    latest_close_up = (
+        len(candles) >= 2
+        and
+        candles[-1]["close"]
+        >
+        candles[-2]["close"]
+    )
+
+    # Compare recent rebound volume with the volume before
+    # the final capitulation low.
+    baseline_start = max(
+        0,
+        best_low_index - 10
+    )
+
+    baseline_volumes = [
+        candle["volume"]
+        for candle
+        in candles[
+            baseline_start:
+            best_low_index
+        ]
+        if candle["volume"] > 0
+    ]
+
+    recent_volumes = [
+        candle["volume"]
+        for candle
+        in post_low[-2:]
+        if candle["volume"] > 0
+    ]
+
+    rebound_volume_ratio = 0.0
+
+    if (
+        baseline_volumes
+        and
+        recent_volumes
+    ):
+        baseline_volume = (
+            statistics.median(
+                baseline_volumes
+            )
+        )
+
+        if baseline_volume > 0:
+            rebound_volume_ratio = (
+                statistics.mean(
+                    recent_volumes
+                )
+                /
+                baseline_volume
+            )
+
+    return {
+        "crash_pct":
+            best_drop,
+
+        "peak_price":
+            best_peak_price,
+
+        "bottom_price":
+            low_price,
+
+        "candles_after_low":
+            candles_after_low,
+
+        "recovery_pct":
+            recovery_pct,
+
+        "post_low_range_pct":
+            post_low_range_pct,
+
+        "higher_closes":
+            higher_closes,
+
+        "higher_lows":
+            higher_lows,
+
+        "latest_green":
+            latest_green,
+
+        "latest_close_up":
+            latest_close_up,
+
+        "rebound_volume_ratio":
+            rebound_volume_ratio,
+
+        "last_completed_close":
+            current_close,
+    }
+
+
+def qualifies_as_bottom_reversal(
+    metrics
+):
+    if metrics is None:
+        return False
+
+    return (
+        metrics["crash_pct"]
+        >=
+        BOTTOM_MIN_CRASH_PCT
+
+        and
+
+        BOTTOM_MIN_CANDLES_AFTER_LOW
+        <=
+        metrics["candles_after_low"]
+        <=
+        BOTTOM_MAX_CANDLES_AFTER_LOW
+
+        and
+
+        BOTTOM_MIN_RECOVERY_PCT
+        <=
+        metrics["recovery_pct"]
+        <=
+        BOTTOM_MAX_RECOVERY_PCT
+
+        and
+
+        metrics["post_low_range_pct"]
+        <=
+        BOTTOM_MAX_POST_LOW_RANGE_PCT
+
+        and
+
+        metrics["higher_closes"]
+        >=
+        BOTTOM_MIN_HIGHER_CLOSES
+
+        and
+
+        metrics["higher_lows"]
+        >=
+        BOTTOM_MIN_HIGHER_LOWS
+
+        and
+
+        metrics["latest_close_up"]
+    )
+
+
+def bottom_reversal_score(
+    metrics,
+    analysis
+):
+    score = 0
+
+    crash = metrics["crash_pct"]
+
+    if crash >= 50:
+        score += 25
+    elif crash >= 40:
+        score += 22
+    elif crash >= 30:
+        score += 18
+
+    recovery = (
+        metrics[
+            "recovery_pct"
+        ]
+    )
+
+    if 3 <= recovery <= 10:
+        score += 20
+    elif recovery <= 18:
+        score += 14
+
+    post_range = (
+        metrics[
+            "post_low_range_pct"
+        ]
+    )
+
+    if post_range <= 15:
+        score += 15
+    elif post_range <= 25:
+        score += 10
+
+    if metrics["higher_closes"] >= 3:
+        score += 15
+    elif metrics["higher_closes"] >= 2:
+        score += 10
+
+    if metrics["higher_lows"] >= 3:
+        score += 15
+    elif metrics["higher_lows"] >= 2:
+        score += 10
+
+    if metrics["latest_green"]:
+        score += 8
+
+    rebound_volume = (
+        metrics[
+            "rebound_volume_ratio"
+        ]
+    )
+
+    if rebound_volume >= 1.5:
+        score += 10
+    elif rebound_volume >= 1.0:
+        score += 5
+
+    buy_pressure = (
+        analysis.get(
+            "buy_pressure"
+        )
+    )
+
+    if buy_pressure is not None:
+        if buy_pressure >= 65:
+            score += 8
+        elif buy_pressure >= 55:
+            score += 4
+
+    bid_pressure = (
+        analysis.get(
+            "bid_pressure"
+        )
+    )
+
+    if bid_pressure is not None:
+        if bid_pressure >= 60:
+            score += 5
+        elif bid_pressure >= 50:
+            score += 2
+
+    return min(
+        score,
+        100
+    )
+
+
+def scan_bottom_reversals(
+    now,
+    current_prices,
+    daily_data,
+    deep_cache
+):
+    global bottom_scan_cursor
+
+    # Prefer markets with enough 24h turnover to avoid very thin,
+    # easily manipulated pairs.
+    eligible = [
+        symbol
+        for symbol
+        in current_prices
+        if (
+            daily_data.get(
+                symbol,
+                {}
+            ).get(
+                "turnover_24h",
+                0
+            )
+            >=
+            BOTTOM_MIN_TURNOVER_24H
+        )
+    ]
+
+    eligible.sort(
+        key=lambda symbol:
+            daily_data.get(
+                symbol,
+                {}
+            ).get(
+                "turnover_24h",
+                0
+            ),
+        reverse=True
+    )
+
+    if not eligible:
+        return []
+
+    batch_size = min(
+        BOTTOM_SCAN_PER_RUN,
+        len(eligible)
+    )
+
+    batch = [
+        eligible[
+            (
+                bottom_scan_cursor
+                + offset
+            )
+            %
+            len(eligible)
+        ]
+        for offset
+        in range(
+            batch_size
+        )
+    ]
+
+    bottom_scan_cursor = (
+        bottom_scan_cursor
+        + batch_size
+    ) % len(eligible)
+
+    alerts = []
+
+    for symbol in batch:
+        previous = (
+            bottom_last_alert.get(
+                symbol,
+                0
+            )
+        )
+
+        if (
+            now - previous
+            <
+            BOTTOM_COOLDOWN_SECONDS
+        ):
+            continue
+
+        try:
+            candles = (
+                fetch_completed_4h_candles(
+                    symbol,
+                    now
+                )
+            )
+
+            metrics = (
+                bottom_reversal_metrics(
+                    candles
+                )
+            )
+
+            if not qualifies_as_bottom_reversal(
+                metrics
+            ):
+                continue
+
+            # Final live confirmation.  A structurally good base is
+            # not enough on its own; require the full score to pass.
+            if (
+                symbol
+                not in deep_cache
+            ):
+                deep_cache[
+                    symbol
+                ] = (
+                    deep_market_analysis(
+                        symbol
+                    )
+                )
+
+            analysis = (
+                deep_cache[
+                    symbol
+                ]
+            )
+
+            score = (
+                bottom_reversal_score(
+                    metrics,
+                    analysis
+                )
+            )
+
+            if score < BOTTOM_ALERT_SCORE:
+                continue
+
+            alerts.append({
+                "symbol":
+                    symbol,
+
+                "score":
+                    score,
+
+                "crash_pct":
+                    metrics[
+                        "crash_pct"
+                    ],
+
+                "peak_price":
+                    metrics[
+                        "peak_price"
+                    ],
+
+                "bottom_price":
+                    metrics[
+                        "bottom_price"
+                    ],
+
+                "recovery_pct":
+                    metrics[
+                        "recovery_pct"
+                    ],
+
+                "candles_after_low":
+                    metrics[
+                        "candles_after_low"
+                    ],
+
+                "higher_closes":
+                    metrics[
+                        "higher_closes"
+                    ],
+
+                "higher_lows":
+                    metrics[
+                        "higher_lows"
+                    ],
+
+                "rebound_volume_ratio":
+                    metrics[
+                        "rebound_volume_ratio"
+                    ],
+
+                "buy_pressure":
+                    analysis.get(
+                        "buy_pressure"
+                    ),
+
+                "bid_pressure":
+                    analysis.get(
+                        "bid_pressure"
+                    ),
+
+                "current_price":
+                    current_prices[
+                        symbol
+                    ],
+            })
+
+        except Exception as exc:
+            print(
+                "Bottom reversal scan failed "
+                f"for {symbol}:",
+                exc
+            )
+
+    # In the unlikely event that several symbols qualify in the
+    # same batch, keep only the strongest two.
+    alerts.sort(
+        key=lambda item:
+            item["score"],
+        reverse=True
+    )
+
+    return alerts[:2]
 
 
 # ============================================================
@@ -6428,7 +7348,12 @@ def send_signal(
         f"Move: "
         f"{change_text}\n"
         f"Window: "
-        f"{alert['window_label']}"
+        f"{alert['window_label']}\n\n"
+        f"Volume: "
+        f"{fmt_optional_ratio(alert.get('volume_ratio'))} "
+        f"normal\n"
+        f"Buy pressure: "
+        f"{fmt_optional_pressure(alert.get('buy_pressure'))}"
     )
 
     send_telegram(
@@ -6494,6 +7419,78 @@ def send_staircase_signal(alert):
         button_url=bybit_spot_url(symbol),
         button_text=f"📈 Open {coin} on Bybit"
     )
+
+# ============================================================
+# BOTTOM REVERSAL TELEGRAM
+# ============================================================
+
+def send_bottom_reversal_signal(
+    alert
+):
+    symbol = alert[
+        "symbol"
+    ]
+
+    coin = coin_name(
+        symbol
+    )
+
+    message = (
+        f"🌱 {coin} → "
+        f"<b>BOTTOM REVERSAL</b>\n\n"
+
+        f"Score: "
+        f"{alert['score']}/100\n\n"
+
+        f"Prior fall: "
+        f"-{alert['crash_pct']:.2f}%\n"
+
+        f"Bottom: "
+        f"{format_price(alert['bottom_price'])}\n"
+
+        f"Recovery from bottom: "
+        f"+{alert['recovery_pct']:.2f}%\n"
+
+        f"4h candles since low: "
+        f"{alert['candles_after_low']}\n\n"
+
+        f"Higher closes: "
+        f"{alert['higher_closes']}\n"
+
+        f"Higher lows: "
+        f"{alert['higher_lows']}\n"
+
+        f"Rebound volume: "
+        f"{alert['rebound_volume_ratio']:.2f}x baseline\n"
+
+        f"Buy pressure: "
+        f"{fmt_optional_pressure(alert.get('buy_pressure'))}\n"
+
+        f"Order-book bids: "
+        f"{fmt_optional_pressure(alert.get('bid_pressure'))}\n\n"
+
+        f"Current: "
+        f"{format_price(alert['current_price'])}\n"
+
+        f"Detected: "
+        f"{current_uk_time()} UK\n\n"
+
+        "Major drop + bottoming + early recovery detected. "
+        "This is a setup alert, not a guarantee of another rise."
+    )
+
+    send_telegram(
+        message,
+        button_url=
+            bybit_spot_url(
+                symbol
+            ),
+        button_text=
+            f"📈 Open "
+            f"{coin} "
+            f"on Bybit"
+    )
+
 
 # ============================================================
 # EARLY PUMP TELEGRAM
@@ -6861,19 +7858,14 @@ def run_detector():
         # ====================================================
 
         alerts = (
-            detect_signals(
-                now,
-                current_prices
+            confirm_hard_move_alerts(
+                detect_signals(
+                    now,
+                    current_prices
+                ),
+                daily_data,
+                deep_cache
             )
-        )
-
-
-        alerts.extend(
-
-            detect_24h_signals(
-                daily_data
-            )
-
         )
 
 
@@ -6945,6 +7937,20 @@ def run_detector():
 
 
         # ====================================================
+        # 4H BOTTOM REVERSAL
+        # ====================================================
+
+        bottom_alerts = (
+            scan_bottom_reversals(
+                now,
+                current_prices,
+                daily_data,
+                deep_cache
+            )
+        )
+
+
+        # ====================================================
         # UPDATE OLD SIGNAL RESULTS
         # ====================================================
 
@@ -6978,40 +7984,97 @@ def run_detector():
                 f"USDT Spot markets: "
                 f"{len(current_prices)}\n\n"
 
-                "Pump / Crash thresholds:\n"
+                "HIGH-SIGNAL MODE\n\n"
 
-                "5 min: ±5%\n"
+                "Hard Pump / Crash:\n"
+                "5 min: ±5% only\n\n"
 
-                "10 min: ±10%\n"
-
-                "15 min: ±15%\n"
-
-                "24 hours: ±24%\n\n"
-
-                "⚡ Early Pump: enabled\n"
-
-                "🔄 U-Turn: enabled\n"
-
-                "🪜 Staircase: enabled\n"
+                "🔥 Early Pump: score 85+ only\n"
+                "🔄 U-Turn: score 80+ only\n"
+                "🪜 Staircase: strict 30/60/120m shape only\n"
+                "🌱 Bottom Reversal: strict 4h pattern enabled\n\n"
 
                 f"🧠 ML Shadow: "
                 f"{'enabled' if shadow_model is not None else 'disabled'} "
                 "(silent)\n\n"
 
-                "1/3/5 minute history "
-                "warms up during the "
-                "first few minutes.\n"
-
-                "Flexible staircase shape starts "
-                "after roughly 15 minutes; "
-                "30/60/120-minute scales warm up "
-                "as more history is collected. "
-                "The original 15m stair + breakout "
-                "rule also remains enabled."
+                "Bullish alerts share a 45-minute "
+                "per-coin cooldown to reduce duplicates."
             )
 
 
             first_run = False
+
+
+        # ====================================================
+        # SEND BOTTOM REVERSAL SIGNALS FIRST
+        # ====================================================
+
+        for alert in bottom_alerts:
+
+            symbol = alert[
+                "symbol"
+            ]
+
+            if not bullish_alert_allowed(
+                symbol,
+                now
+            ):
+                continue
+
+            try:
+
+                send_bottom_reversal_signal(
+                    alert
+                )
+
+                bottom_last_alert[
+                    symbol
+                ] = now
+
+                mark_bullish_alert(
+                    symbol,
+                    now
+                )
+
+                record_signal(
+
+                    now,
+
+                    "BOTTOM_REVERSAL",
+
+                    symbol,
+
+                    alert[
+                        "current_price"
+                    ],
+
+                    {
+
+                        "score":
+                            alert[
+                                "score"
+                            ],
+
+                        "crash_pct":
+                            alert[
+                                "crash_pct"
+                            ],
+
+                        "recovery_pct":
+                            alert[
+                                "recovery_pct"
+                            ],
+                    }
+                )
+
+            except Exception as exc:
+
+                print(
+                    "Telegram bottom-reversal "
+                    "error:",
+                    exc
+                )
 
 
         # ====================================================
@@ -7020,11 +8083,41 @@ def run_detector():
 
         for alert in alerts:
 
+            symbol = alert[
+                "symbol"
+            ]
+
+            if (
+                alert[
+                    "direction"
+                ]
+                ==
+                "PUMP"
+                and
+                not bullish_alert_allowed(
+                    symbol,
+                    now
+                )
+            ):
+                continue
+
             try:
 
                 send_signal(
                     alert
                 )
+
+                if (
+                    alert[
+                        "direction"
+                    ]
+                    ==
+                    "PUMP"
+                ):
+                    mark_bullish_alert(
+                        symbol,
+                        now
+                    )
 
 
                 record_signal(
@@ -7073,10 +8166,25 @@ def run_detector():
 
         for alert in early_alerts:
 
+            symbol = alert[
+                "symbol"
+            ]
+
+            if not bullish_alert_allowed(
+                symbol,
+                now
+            ):
+                continue
+
             try:
 
                 send_early_pump_signal(
                     alert
+                )
+
+                mark_bullish_alert(
+                    symbol,
+                    now
                 )
 
 
@@ -7149,10 +8257,25 @@ def run_detector():
 
         for alert in uturn_alerts:
 
+            symbol = alert[
+                "symbol"
+            ]
+
+            if not bullish_alert_allowed(
+                symbol,
+                now
+            ):
+                continue
+
             try:
 
                 send_uturn_signal(
                     alert
+                )
+
+                mark_bullish_alert(
+                    symbol,
+                    now
                 )
 
 
@@ -7205,10 +8328,25 @@ def run_detector():
 
         for alert in staircase_alerts:
 
+            symbol = alert[
+                "symbol"
+            ]
+
+            if not bullish_alert_allowed(
+                symbol,
+                now
+            ):
+                continue
+
             try:
 
                 send_staircase_signal(
                     alert
+                )
+
+                mark_bullish_alert(
+                    symbol,
+                    now
                 )
 
 
@@ -7301,6 +8439,11 @@ def run_detector():
                     staircase_alerts
                 ),
 
+            "bottom_reversal_signals":
+                len(
+                    bottom_alerts
+                ),
+
             "shadow":
                 shadow_result,
 
@@ -7378,14 +8521,8 @@ def home():
             "5_min":
                 "±5%",
 
-            "10_min":
-                "±10%",
-
-            "15_min":
-                "±15%",
-
-            "24_hours":
-                "±24%",
+            "mode":
+                "5-minute hard move only; 10m/15m/24h Telegram hard-move alerts disabled",
         },
 
 
@@ -7455,7 +8592,7 @@ def home():
                 "enabled",
 
             "mode":
-                "flexible visual shape + original 15m breakout",
+                "strict flexible rising shape only",
 
             "shape_windows_minutes":
                 list(
@@ -7473,12 +8610,45 @@ def home():
 
             "shape_max_pullback_pct":
                 STAIR_SHAPE_MAX_PULLBACK,
+        },
 
-            "legacy_timeframe":
-                "15m",
 
-            "legacy_candles":
-                STAIRCASE_CANDLES,
+        "bottom_reversal": {
+
+            "status":
+                "enabled",
+
+            "timeframe":
+                "4h completed candles",
+
+            "minimum_prior_fall":
+                f"{BOTTOM_MIN_CRASH_PCT}%",
+
+            "recovery_zone":
+                (
+                    f"{BOTTOM_MIN_RECOVERY_PCT}%"
+                    f" to "
+                    f"{BOTTOM_MAX_RECOVERY_PCT}%"
+                ),
+
+            "alert_score":
+                BOTTOM_ALERT_SCORE,
+
+            "scan_per_run":
+                BOTTOM_SCAN_PER_RUN,
+
+            "minimum_24h_turnover_usdt":
+                BOTTOM_MIN_TURNOVER_24H,
+        },
+
+
+        "anti_spam": {
+
+            "bullish_per_coin_cooldown_minutes":
+                (
+                    BULLISH_GLOBAL_COOLDOWN_SECONDS
+                    / 60
+                ),
         },
 
 
